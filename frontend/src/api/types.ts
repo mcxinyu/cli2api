@@ -73,10 +73,12 @@ export type ModelInfo = {
   max_output_tokens_max?: number
   prompt_max_tokens_max?: number
   reasoning_options?: string[]
+  reasoning_option_values?: string[]
   reasoning_default?: string
   reasoning_effort?: string
   reasoning_type?: string
   can_disable_thinking?: boolean
+  supports_images?: boolean
 }
 
 export type CheckinRecord = {
@@ -178,6 +180,9 @@ export type Overview = {
     last_checkin_at?: string
     last_checkin_msg?: string
     last_checkin_status?: string
+    last_checkin_source?: string
+    last_checkin_synced_at?: string
+    checkin_auto_time?: string
     quota?: AccountQuota
     created_at?: string
     updated_at?: string

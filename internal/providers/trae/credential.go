@@ -27,6 +27,9 @@ const (
 	AuthFrom = "trae"
 	AppID    = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
 	// IdeVersion is the x_app_version / IDEVersion sent on login + exchange.
+	// Keep the Trae client identity values used by cli2api v0.7.44: newer build
+	// codes can make upstream return an older model catalog and omit newly
+	// released models.
 	IdeVersion     = "3.3.62"
 	IdeVersionCode = "20260811"
 	DeviceBrand    = "83DG"

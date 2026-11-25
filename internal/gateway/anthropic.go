@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/caigee-cmd/cli2api/internal/accounts"
+	"github.com/caigee-cmd/cli2api/internal/executor"
 	"github.com/caigee-cmd/cli2api/internal/translate"
 )
 
@@ -37,7 +38,7 @@ func (h *Handler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Request
 	}
 	rectified := rawBody
 	var rectify translate.RectifyResult
-	if thinkingRectifierOn() {
+	if thinkingRectifierOn() && shouldRectifyAnthropicRequest(rawBody) {
 		var rectifyErr error
 		rectified, rectify, rectifyErr = translate.RectifyAnthropicRequest(rawBody)
 		if rectifyErr != nil {
@@ -119,7 +120,7 @@ func (h *Handler) handleAnthropicMessagesStream(w http.ResponseWriter, r *http.R
 	}
 	h.finishCompatibility(execution, upstream.AccountID, upstream.Provider, upstream.Routing, status, ttfb, &stats, logErr, upstream.AttemptCount, upstream.ReasoningLevel)
 	if relayErr == nil {
-		h.Executor.CommitSession(execution.Context, execution.Request, upstream.Routing, upstream.AccountID)
+		h.Executor.CommitSession(execution.Context, execution.Request, upstream.Routing, firstNonEmpty(upstream.PoolAccountID, upstream.AccountID))
 		return
 	}
 	if !IsStreamClientDisconnect(relayErr) {
@@ -168,6 +169,25 @@ func anthropicErrorType(kind string) string {
 	}
 }
 
+// shouldRectifyAnthropicRequest keeps the legacy thinking rectifier for plain
+// OpenAI-compatible upstreams. Providers with signed/encrypted reasoning
+// envelopes (Codex, Kiro, Muse/Meta) need those blocks preserved for replay,
+// so the gateway must not strip them before the adapter sees the request.
+func shouldRectifyAnthropicRequest(raw []byte) bool {
+	var body struct {
+		Model string `json:"model"`
+	}
+	if json.Unmarshal(raw, &body) != nil {
+		return true
+	}
+	switch executor.ProviderPrefix(body.Model) {
+	case "codex", "kiro", "meta", "muse":
+		return false
+	default:
+		return true
+	}
+}
+
 func anthropicMessageResponse(requestID, model, content, reasoning string, toolCalls []proxyToolCall, finishReason string, promptTokens, completionTokens int, cacheReadTokens, cacheWriteTokens *int) map[string]any {
 	blocks := make([]any, 0, 2+len(toolCalls))
 	if reasoning != "" {
@@ -186,21 +206,22 @@ func anthropicMessageResponse(requestID, model, content, reasoning string, toolC
 	if len(blocks) == 0 {
 		blocks = append(blocks, map[string]any{"type": "text", "text": ""})
 	}
-	usage := map[string]any{
-		"input_tokens":  promptTokens,
-		"output_tokens": completionTokens,
-	}
-	if cacheReadTokens != nil {
-		usage["cache_read_input_tokens"] = *cacheReadTokens
-	}
-	if cacheWriteTokens != nil {
-		usage["cache_creation_input_tokens"] = *cacheWriteTokens
-	}
+	usage := anthropicUsage(promptTokens, completionTokens, cacheReadTokens, cacheWriteTokens)
 	return map[string]any{
 		"id": "msg_" + requestID, "type": "message", "role": "assistant", "model": model,
 		"content": blocks, "stop_reason": anthropicStopReason(finishReason, toolCalls), "stop_sequence": nil,
 		"usage": usage,
 	}
+}
+
+func saturatingSubInt(value, subtract int) int {
+	if subtract <= 0 {
+		return value
+	}
+	if value <= subtract {
+		return 0
+	}
+	return value - subtract
 }
 
 func anthropicStopReason(finishReason string, toolCalls []proxyToolCall) string {

@@ -3,6 +3,8 @@ package executor
 import (
 	"testing"
 	"time"
+
+	"github.com/caigee-cmd/cli2api/internal/accounts"
 )
 
 func TestRoundRobinSkipsDownAccounts(t *testing.T) {
@@ -309,6 +311,76 @@ func TestFillFirstUsesHighestPriorityUntilUnavailable(t *testing.T) {
 	}
 }
 
+func TestQuotaStrategiesRankByRemainingRatio(t *testing.T) {
+	newPool := func(strategy string) *Pool {
+		p := NewPool(nil, nil)
+		p.SetRoutingStrategy(strategy)
+		p.Upsert(Item{ID: "unknown", Quota: nil})
+		p.Upsert(Item{ID: "mid", Quota: &QuotaSnapshot{Remaining: 50, Total: 100}})
+		p.Upsert(Item{ID: "low", Quota: &QuotaSnapshot{Remaining: 10, Total: 100}})
+		p.Upsert(Item{ID: "high", Quota: &QuotaSnapshot{Percentage: 10}})
+		return p
+	}
+
+	p := newPool(RoutingStrategyLeastQuotaFirst)
+	if item, ok := p.Pick("", nil); !ok || item.ID != "low" {
+		t.Fatalf("least quota first = %+v, ok=%v", item, ok)
+	}
+	excluded := map[string]struct{}{"low": {}}
+	if item, ok := p.Pick("", excluded); !ok || item.ID != "mid" {
+		t.Fatalf("least quota fallback = %+v, ok=%v", item, ok)
+	}
+
+	p = newPool(RoutingStrategyMostQuotaFirst)
+	if item, ok := p.Pick("", nil); !ok || item.ID != "high" {
+		t.Fatalf("most quota first = %+v, ok=%v", item, ok)
+	}
+	excluded = map[string]struct{}{"high": {}}
+	if item, ok := p.Pick("", excluded); !ok || item.ID != "mid" {
+		t.Fatalf("most quota fallback = %+v, ok=%v", item, ok)
+	}
+
+	p = newPool(RoutingStrategyMostQuotaFirst)
+	if item, ok := p.Pick("", map[string]struct{}{"high": {}, "mid": {}}); !ok || item.ID != "low" {
+		t.Fatalf("unknown quota must sort after known: %+v, ok=%v", item, ok)
+	}
+}
+
+func TestModelPoolQuotaStrategyOverride(t *testing.T) {
+	p := NewPool(nil, nil)
+	p.Upsert(Item{ID: "low", Quota: &QuotaSnapshot{Remaining: 1, Total: 100}})
+	p.Upsert(Item{ID: "high", Quota: &QuotaSnapshot{Remaining: 99, Total: 100}})
+	item, ok := p.PickRoute(RouteQuery{StrategyOverride: string(accounts.AggregationLeastQuotaFirst)})
+	if !ok || item.ID != "low" {
+		t.Fatalf("aggregation least quota override = %+v, ok=%v", item, ok)
+	}
+}
+
+func TestFEFOStrategyOverrideAppliesToCandidates(t *testing.T) {
+	p := NewPool(nil, nil)
+	p.Upsert(Item{
+		ID: "expired",
+		Quota: &QuotaSnapshot{
+			Packages: []accounts.QuotaPackage{{
+				Scope:  accounts.QuotaPackageScopeAccountFEFO,
+				Unit:   "credits",
+				Remain: 10,
+				EndsAt: time.Now().Add(-time.Hour).Unix(),
+			}},
+		},
+	})
+	q := RouteQuery{PublicModel: "paid", StrategyOverride: RoutingStrategyFEFO}
+	if n := p.LenRoute(q); n != 0 {
+		t.Fatalf("FEFO override must exclude depleted package from candidate count, got %d", n)
+	}
+	if p.HasCapacity(q) {
+		t.Fatal("FEFO override must exclude depleted package from capacity")
+	}
+	if item, ok := p.PickRoute(q); ok {
+		t.Fatalf("FEFO override must exclude depleted package from selection, got %+v", item)
+	}
+}
+
 func TestModelCooldownLeavesOtherModelsAvailable(t *testing.T) {
 	p := NewPool([]string{"http://a:3020"}, []string{"a"})
 	p.MarkClassified("a", Classified{Kind: KindRateLimit, Cooldown: time.Hour, Failover: true, Model: "glm-5.3"})
@@ -342,6 +414,9 @@ func TestRepeatedFailuresBackOff(t *testing.T) {
 	p.MarkClassified("a", Classified{Kind: KindRateLimit, Cooldown: base, Failover: true})
 	first, _ := p.ByID("a")
 
+	// Windows timers can resolve coarser than the two consecutive calls; let
+	// the clock advance so the extended deadline is observable.
+	time.Sleep(10 * time.Millisecond)
 	p.MarkClassified("a", Classified{Kind: KindRateLimit, Cooldown: base, Failover: true})
 	second, _ := p.ByID("a")
 	if !second.DownUntil.After(first.DownUntil) {
@@ -452,7 +527,10 @@ func TestBackoffResetsOnKindChange(t *testing.T) {
 	p.MarkClassified("a", Classified{Kind: KindRateLimit, Cooldown: base, Failover: true})
 	first, _ := p.ByID("a")
 	// Different kind with the same base cooldown: ladder restarts, so the
-	// cooldown must not exceed (and should equal) the base.
+	// cooldown must not exceed (and should equal) the base. Wait for the
+	// clock to advance so Windows' coarser timer cannot return the same
+	// instant for both calls.
+	time.Sleep(10 * time.Millisecond)
 	p.MarkClassified("a", Classified{Kind: KindAuth, Cooldown: base, Failover: true})
 	second, _ := p.ByID("a")
 	if !second.DownUntil.After(first.DownUntil) {
@@ -680,5 +758,48 @@ func TestUpsertPreservesInFlight(t *testing.T) {
 	item, _ := p.ByID("a")
 	if item.InFlight != 1 {
 		t.Fatalf("Upsert must keep InFlight, got %d", item.InFlight)
+	}
+}
+
+func TestQuotaRemainingRatioTreatsZeroSnapshotAsUnknown(t *testing.T) {
+	if _, known := quotaRemainingRatio(Item{Quota: &accounts.QuotaSnapshot{}}); known {
+		t.Fatal("empty quota snapshot must be unknown, not 100% remaining")
+	}
+	if ratio, known := quotaRemainingRatio(Item{Quota: &accounts.QuotaSnapshot{Percentage: 40}}); !known || ratio != 0.6 {
+		t.Fatalf("percentage-only ratio = %v known=%v, want 0.6/true", ratio, known)
+	}
+	if ratio, known := quotaRemainingRatio(Item{Quota: &accounts.QuotaSnapshot{Total: 10, Remaining: 3}}); !known || ratio != 0.3 {
+		t.Fatalf("total/remaining ratio = %v known=%v, want 0.3/true", ratio, known)
+	}
+}
+
+func TestPickQuotaStrategySortsUnknownQuotaLast(t *testing.T) {
+	unknown := Item{ID: "unknown", Quota: &accounts.QuotaSnapshot{}}
+	known := Item{ID: "known", Quota: &accounts.QuotaSnapshot{Total: 10, Remaining: 5}}
+	if picked := pickQuotaStrategy([]Item{unknown, known}, true, ""); picked.ID != "known" {
+		t.Fatalf("most-quota-first picked %q, want known (unknown quota sorts last)", picked.ID)
+	}
+	if picked := pickQuotaStrategy([]Item{unknown, known}, false, ""); picked.ID != "known" {
+		t.Fatalf("least-quota-first picked %q, want known (unknown quota sorts last)", picked.ID)
+	}
+}
+
+// Equal or unknown quotas must still rotate; otherwise least-quota-first pins
+// the route to the lowest ID and an exhausted account is retried forever.
+func TestPickQuotaStrategyRotatesTies(t *testing.T) {
+	p := NewPool(nil, nil)
+	p.Upsert(Item{ID: "a1", Provider: "qoder", Models: []string{"shared"}})
+	p.Upsert(Item{ID: "a2", Provider: "qoder", Models: []string{"shared"}})
+	p.SetRoutingStrategy(RoutingStrategyLeastQuotaFirst)
+	counts := map[string]int{}
+	for i := 0; i < 10; i++ {
+		item, ok := p.PickRoute(RouteQuery{PublicModel: "shared"})
+		if !ok {
+			t.Fatal("no route")
+		}
+		counts[item.ID]++
+	}
+	if counts["a1"] == 0 || counts["a2"] == 0 {
+		t.Fatalf("quota strategy pinned one account: %v", counts)
 	}
 }

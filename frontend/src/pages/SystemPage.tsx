@@ -18,13 +18,13 @@ import {
 import { fetchConsoleKey, rotateConsoleKey, type ConsoleKeyView } from '@/api/keys'
 import { fetchSystemSettings, updateSystemSettings, type SystemSettings } from '@/api/system'
 import { useApiKey } from '@/hooks/useApiKey'
+import { useOverview } from '@/hooks/useOverview'
 import { PageAlert } from '@/components/ui/PageAlert'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { FormRow } from '@/components/ui/FormRow'
 import { SystemPageSkeleton } from '@/components/ui/PageSkeletons'
 import { useI18n } from '@/hooks/useI18n'
 import { CompactSwitch } from '@/components/ui/CompactSwitch'
-import { CheckinDefaults } from '@/components/checkin/CheckinDefaults'
 import { UpdateControls } from '@/components/system/UpdateControls'
 import { useSystemUpdate } from '@/hooks/useSystemUpdate'
 import { VersionHistory } from '@/components/VersionHistory'
@@ -41,6 +41,7 @@ export function SystemPage() {
   const tab: SettingsTab = tabParam && SETTINGS_TABS.includes(tabParam) ? tabParam : 'general'
   const selectTab = (next: SettingsTab) => setSearchParams(next === 'general' ? {} : { tab: next }, { replace: true })
   const { setApiKey } = useApiKey()
+  const { refresh: refreshOverview } = useOverview()
   const [consoleKey, setConsoleKey] = useState<ConsoleKeyView | null>(null)
   const [settings, setSettings] = useState<SystemSettings | null>(null)
   const [proxyDraft, setProxyDraft] = useState('')
@@ -78,6 +79,9 @@ export function SystemPage() {
     setError('')
     try {
       setSettings(await updateSystemSettings({ cross_provider_model_pool: enabled }))
+      // The sidebar entry and the route guard read this flag from the overview
+      // summary; refresh it so toggling the switch takes effect immediately.
+      void refreshOverview(undefined, { silent: true }).catch(() => undefined)
     } catch (err) {
       setSettings((current) => current ? { ...current, cross_provider_model_pool: previous } : current)
       setError(err instanceof Error ? err.message : String(err))
@@ -222,7 +226,6 @@ export function SystemPage() {
               <span className="font-medium text-foreground">{settings?.checkin_disabled_accounts ? t('enabled') : t('disabled')}</span>
             </div>
           </Card>
-          <CheckinDefaults settings={settings} onSaved={setSettings} />
           </div>
         </Tabs.Panel>
         <Tabs.Panel id="routing" className="pt-5">
@@ -256,6 +259,8 @@ export function SystemPage() {
                       <ListBox.Item id="weighted-round-robin" textValue="weighted-round-robin"><Label>{t('routingWeightedRoundRobin')}</Label><ListBox.ItemIndicator /></ListBox.Item>
                       <ListBox.Item id="fill-first" textValue="fill-first"><Label>{t('routingFillFirst')}</Label><ListBox.ItemIndicator /></ListBox.Item>
                       <ListBox.Item id="fefo" textValue="fefo"><Label>{t('routingFEFO')}</Label><ListBox.ItemIndicator /></ListBox.Item>
+                      <ListBox.Item id="least-quota-first" textValue="least-quota-first"><Label>{t('routingLeastQuotaFirst')}</Label><ListBox.ItemIndicator /></ListBox.Item>
+                      <ListBox.Item id="most-quota-first" textValue="most-quota-first"><Label>{t('routingMostQuotaFirst')}</Label><ListBox.ItemIndicator /></ListBox.Item>
                     </ListBox>
                   </Select.Popover>
                 </Select>

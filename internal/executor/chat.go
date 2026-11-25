@@ -63,8 +63,12 @@ type ChatResult struct {
 }
 
 type StreamResult struct {
-	Response       *http.Response
-	AccountID      string
+	Response  *http.Response
+	AccountID string
+	// PoolAccountID is the pool routing key for AccountID. A worker may
+	// rewrite the response account label, but session affinity and cooldown
+	// bookkeeping must always address the pool item.
+	PoolAccountID  string
 	Provider       string
 	AttemptCount   int
 	TTFBMs         int
@@ -249,7 +253,7 @@ func stickyAccountCanServeModel(item Item, publicModel string) bool {
 	return ItemCouldServeModel(probe, publicModel)
 }
 
-func (e ChatExecutor) prepareRouting(ctx context.Context, prefer, providerFilter string, req translate.ChatRequest) (string, string, string, routingPlan) {
+func (e ChatExecutor) prepareRouting(ctx context.Context, prefer, providerFilter string, req translate.ChatRequest, plan *AggregatePlan) (string, string, string, routingPlan) {
 	prefer = strings.TrimSpace(prefer)
 	providerFilter = strings.ToLower(strings.TrimSpace(providerFilter))
 	publicModel := req.Model
@@ -257,34 +261,39 @@ func (e ChatExecutor) prepareRouting(ctx context.Context, prefer, providerFilter
 		return prefer, providerFilter, "", routingPlan{Source: routingPin, PublicModel: publicModel}
 	}
 
-	plan := routingPlan{Source: routingPool, SessionKey: resolveSessionKey(ctx, req), PublicModel: publicModel}
-	if plan.SessionKey == "" || e.SessionAffinity == nil || e.Pool == nil {
-		return "", providerFilter, "", plan
+	planRoute := routingPlan{Source: routingPool, SessionKey: resolveSessionKey(ctx, req), PublicModel: publicModel}
+	if planRoute.SessionKey == "" || e.SessionAffinity == nil || e.Pool == nil {
+		return "", providerFilter, "", planRoute
 	}
-	accountID, ok := e.SessionAffinity.Get(plan.SessionKey)
+	accountID, ok := e.SessionAffinity.Get(planRoute.SessionKey)
 	if !ok {
-		return "", providerFilter, "", plan
+		return "", providerFilter, "", planRoute
 	}
 	item, ok := e.Pool.ByID(accountID)
 	if !ok {
 		e.SessionAffinity.RecordEscape("account_missing")
-		e.SessionAffinity.Forget(plan.SessionKey)
-		return "", providerFilter, "", plan
+		e.SessionAffinity.Forget(planRoute.SessionKey)
+		return "", providerFilter, "", planRoute
 	}
 	if providerFilter != "" && providerFilter != itemProvider(item) {
 		e.SessionAffinity.RecordEscape("provider_mismatch")
-		return "", providerFilter, "", plan
+		return "", providerFilter, "", planRoute
 	}
 	if !accounts.ProviderRegionAllowed(itemProvider(item), accounts.NormalizeRegion(item.Region), allowedProvidersFrom(ctx)) {
 		e.SessionAffinity.RecordEscape("provider_not_allowed")
-		return "", providerFilter, "", plan
+		return "", providerFilter, "", planRoute
 	}
-	if !stickyAccountCanServeModel(item, publicModel) {
+	if plan != nil {
+		if !plan.CanServeAccount(item) {
+			e.SessionAffinity.RecordEscape("model_unavailable")
+			return "", providerFilter, "", planRoute
+		}
+	} else if !stickyAccountCanServeModel(item, publicModel) {
 		e.SessionAffinity.RecordEscape("model_unavailable")
-		return "", providerFilter, "", plan
+		return "", providerFilter, "", planRoute
 	}
 	return item.ID, itemProvider(item), accounts.NormalizeRegion(item.Region), routingPlan{
-		Source: routingSticky, SessionKey: plan.SessionKey, BoundAccount: item.ID, PublicModel: publicModel,
+		Source: routingSticky, SessionKey: planRoute.SessionKey, BoundAccount: item.ID, PublicModel: publicModel,
 	}
 }
 
@@ -339,8 +348,8 @@ func (e ChatExecutor) providerHasCapacity(pinnedProvider, pinnedRegion, publicMo
 	return e.Pool.HasCapacity(query)
 }
 
-func (e ChatExecutor) routeQuery(prefer, providerFilter, regionFilter, publicModel string, allowed []string, excluded map[string]struct{}, eligible func(Item) bool) RouteQuery {
-	return RouteQuery{
+func (e ChatExecutor) routeQuery(prefer, providerFilter, regionFilter, publicModel string, allowed []string, excluded map[string]struct{}, eligible func(Item) bool, plan ...*AggregatePlan) RouteQuery {
+	q := RouteQuery{
 		PublicModel:      publicModel,
 		PreferAccount:    prefer,
 		ProviderFilter:   providerFilter,
@@ -349,13 +358,23 @@ func (e ChatExecutor) routeQuery(prefer, providerFilter, regionFilter, publicMod
 		Excluded:         excluded,
 		Eligible:         eligible,
 	}
+	if len(plan) > 0 && plan[0] != nil {
+		p := plan[0]
+		q.ModelResolver = p.resolver()
+		q.StrategyOverride = string(p.Strategy)
+		if p.Strategy == accounts.AggregationPriority {
+			q.PriorityResolver = p.priorityResolver()
+		}
+		q.WeightResolver = p.weightResolver()
+	}
+	return q
 }
 
-func (e ChatExecutor) pick(requestID, prefer, providerFilter, regionFilter, publicModel string, allowed []string, excluded map[string]struct{}, eligible func(Item) bool) (Item, error) {
-	query := e.routeQuery(prefer, providerFilter, regionFilter, publicModel, allowed, excluded, eligible)
+func (e ChatExecutor) pick(requestID, prefer, providerFilter, regionFilter, publicModel string, allowed []string, excluded map[string]struct{}, eligible func(Item) bool, plan *AggregatePlan) (Item, error) {
+	query := e.routeQuery(prefer, providerFilter, regionFilter, publicModel, allowed, excluded, eligible, plan)
 	if e.Pool != nil {
 		if item, ok := e.Pool.PickRoute(query); ok {
-			if retryAfter := e.Pool.RetryAfter(item, publicModel); retryAfter > 0 {
+			if retryAfter := e.Pool.RetryAfter(item, publicModel, query.ModelResolver); retryAfter > 0 {
 				return Item{}, coolingPickError(item, publicModel, retryAfter)
 			}
 			return item, nil
@@ -394,29 +413,65 @@ func (e ChatExecutor) pick(requestID, prefer, providerFilter, regionFilter, publ
 			unfiltered.PublicModel = ""
 			if e.Pool.LenRoute(unfiltered) > 0 {
 				e.logModelRouteMiss(requestID, query)
-				return Item{}, fmt.Errorf("model_not_available: %s is not available for the selected accounts", publicModel)
+				return Item{}, NewExecutionError(Classified{
+					Kind: accounts.KindModelNotAvailable, Status: http.StatusBadRequest,
+					Code: "model_not_available", Type: "invalid_request_error", Failover: false,
+					Message: fmt.Sprintf("model_not_available: %s is not available for the selected accounts", publicModel),
+				}, nil)
 			}
 		}
 	}
 	if len(allowed) > 0 && providerFilter != "" && !accounts.ProviderAllowed(providerFilter, allowed) {
-		return Item{}, fmt.Errorf("api key cannot use provider %s", providerFilter)
+		return Item{}, NewExecutionError(Classified{
+			Kind: accounts.KindAuth, Status: http.StatusForbidden, Code: "provider_not_allowed",
+			Type: "permission_error", Failover: false,
+			Message: fmt.Sprintf("api key cannot use provider %s", providerFilter),
+		}, nil)
 	}
 	if providerFilter != "" && regionFilter != "" {
-		return Item{}, fmt.Errorf("no %s/%s accounts available", providerFilter, regionFilter)
+		return Item{}, noAccountsError(fmt.Sprintf("no %s/%s accounts available", providerFilter, regionFilter))
 	}
 	if providerFilter != "" {
 		// A key whose grant list narrows this family to a single region
 		// should fail with that region in the message, even when the
 		// request itself did not pin one.
 		if regionFilter, narrowed := keyGrantedSingleRegion(providerFilter, allowed); narrowed {
-			return Item{}, fmt.Errorf("no %s/%s accounts available", providerFilter, regionFilter)
+			return Item{}, noAccountsError(fmt.Sprintf("no %s/%s accounts available", providerFilter, regionFilter))
 		}
-		return Item{}, fmt.Errorf("no %s accounts available", providerFilter)
+		return Item{}, noAccountsError(fmt.Sprintf("no %s accounts available", providerFilter))
 	}
 	if len(allowed) > 0 {
-		return Item{}, fmt.Errorf("no accounts available for this api key")
+		return Item{}, noAccountsError("no accounts available for this api key")
 	}
-	return Item{}, fmt.Errorf("no worker accounts configured")
+	return Item{}, NewExecutionError(Classified{
+		Kind: accounts.KindUnavailable, Status: http.StatusServiceUnavailable,
+		Code: "no_accounts_configured", Type: "api_error", Failover: false,
+		Message: "no worker accounts configured",
+	}, nil)
+}
+
+// noAccountsRetryAfter mirrors runtime's workerReconcileInterval: the liveness
+// watchdog re-probes an unready worker at most once per this interval, so a
+// retry before then cannot observe a recovery and would just repeat the miss.
+const noAccountsRetryAfter = 2 * time.Minute
+
+// noAccountsError reports that routing found no account able to serve this
+// key/model. It must be a classified error: a bare error reaches the gateway as
+// an unclassified failure, which renders it as 502 "upstream_error". That reads
+// as an origin outage to every client and to any proxy in front of the gateway
+// (Cloudflare replaced it with its own "Bad gateway" page), while the real
+// cause is local routing — no enabled account matches the key's provider grant
+// or the requested model. 503 matches KindUnavailable; 429 is reserved for
+// rate/credit limits in this taxonomy, and SDKs auto-retry it on a fixed
+// schedule even though every such retry fails until the account is restored.
+// The Retry-After hint lines up with the watchdog's per-account re-probe
+// cadence, which is when a self-healing miss can actually clear.
+func noAccountsError(message string) error {
+	return NewExecutionError(Classified{
+		Kind: accounts.KindUnavailable, Status: http.StatusServiceUnavailable,
+		Code: "no_accounts", Type: "api_error", Message: message,
+		Cooldown: noAccountsRetryAfter, RetryAfter: noAccountsRetryAfter, Failover: false,
+	}, nil)
 }
 
 func (e ChatExecutor) logModelRouteMiss(requestID string, query RouteQuery) {
@@ -525,10 +580,10 @@ func coolingPickError(item Item, publicModel string, retryAfter time.Duration) e
 	}, nil)
 }
 
-func (e ChatExecutor) attemptsFor(providerFilter, regionFilter, publicModel string, allowed []string, eligible ...func(Item) bool) int {
-	var predicate func(Item) bool
-	if len(eligible) > 0 {
-		predicate = eligible[0]
+func (e ChatExecutor) attemptsFor(providerFilter, regionFilter, publicModel string, allowed []string, predicate func(Item) bool, resolver ...func(Item) string) int {
+	var resolve func(Item) string
+	if len(resolver) > 0 {
+		resolve = resolver[0]
 	}
 	maxAttempts := e.MaxAttempts
 	if maxAttempts <= 0 {
@@ -538,7 +593,9 @@ func (e ChatExecutor) attemptsFor(providerFilter, regionFilter, publicModel stri
 		maxAttempts = 64
 	}
 	if e.Pool != nil {
-		if n := e.Pool.LenRoute(e.routeQuery("", providerFilter, regionFilter, publicModel, allowed, nil, predicate)); n > 0 {
+		query := e.routeQuery("", providerFilter, regionFilter, publicModel, allowed, nil, predicate)
+		query.ModelResolver = resolve
+		if n := e.Pool.LenRoute(query); n > 0 {
 			if n > maxAttempts {
 				return maxAttempts
 			}
@@ -885,13 +942,59 @@ type routeLoop struct {
 	attempts       int
 	pinned         string
 	index          int
+	// regionPinned records that this request chose its region implicitly from
+	// the first picked account (not from a model prefix, grant, or explicit
+	// pin). A later failure releases that pin so failover can cross regions.
+	regionPinned bool
 	// eligible narrows candidates to one protocol capability; nil admits all.
 	eligible func(Item) bool
+	// resolver maps an item to its concrete aggregated model. Nil for normal
+	// (non-aggregated) requests. Pure and read-only; safe under Pool.mu.
+	resolver func(Item) string
+	// plan is the immutable per-request aggregate plan; nil for normal routes.
+	// It carries the per-model strategy/weights used by Pool.PickRoute.
+	plan *AggregatePlan
+	// tierAttempts and tierBudget apply only to priority aggregation. Each
+	// priority tier gets its own budget, so sibling accounts of the first
+	// provider cannot consume every retry before a lower-priority provider is
+	// reached. When a tier is exhausted its remaining accounts are added to
+	// excluded.
+	tierAttempts map[int]int
+	tierBudget   int
 }
 
 func (e ChatExecutor) newRouteLoop(ctx context.Context, prefer, providerFilter string, req translate.ChatRequest) routeLoop {
-	prefer, providerFilter, regionFilter, routing := e.prepareRouting(ctx, prefer, providerFilter, req)
+	aggPlan := aggregatePlanFrom(ctx)
+	prefer, providerFilter, regionFilter, routing := e.prepareRouting(ctx, prefer, providerFilter, req, aggPlan)
 	allowed := allowedProvidersFrom(ctx)
+	// Capture the aggregate resolver once from the immutable per-request plan.
+	// If a plan exists, the public model is virtual and must not be pinned by a
+	// provider prefix; the plan's members already carry provider/region.
+	var resolver func(Item) string
+	if aggPlan != nil {
+		resolver = aggPlan.resolver()
+		providerFilter, regionFilter = "", ""
+		switch routing.Source {
+		case routingSticky:
+			// Keep the cache-affine binding. The public ID is virtual, so the
+			// account was already validated against the plan's members in
+			// prepareRouting; prefer selects it without re-imposing a provider.
+			prefer = routing.BoundAccount
+		case routingPin:
+			// An explicit pin is useful only when the pinned account can serve
+			// a member of this logical model.
+			if e.Pool != nil {
+				if pinned, ok := e.Pool.ByID(prefer); ok && aggPlan.CanServeAccount(pinned) {
+					break
+				}
+			}
+			prefer = ""
+			routing = routingPlan{Source: routingPool, SessionKey: routing.SessionKey, PublicModel: req.Model}
+		default:
+			prefer = ""
+			routing = routingPlan{Source: routingPool, SessionKey: routing.SessionKey, PublicModel: req.Model}
+		}
+	}
 	// A model-name region prefix (e.g. "workbuddy-cn/model") sets an explicit
 	// region that overrides sticky-session and pin-derived regions. It
 	// coexists with key grants: routeBaseMatches enforces both filters
@@ -909,10 +1012,49 @@ func (e ChatExecutor) newRouteLoop(ctx context.Context, prefer, providerFilter s
 			regionFilter = granted
 		}
 	}
-	if regionFilter == "" && prefer != "" && e.Pool != nil {
+	if aggPlan == nil && regionFilter == "" && prefer != "" && e.Pool != nil {
 		if pinnedItem, ok := e.Pool.ByID(prefer); ok {
 			regionFilter = pinRegion("", pinnedItem.Region)
 		}
+	}
+	// Per-model failover settings win over the executor global attempt budget.
+	// AllowFallbacks=false means the single best account only; MaxAttempts caps
+	// how many distinct accounts/members may be tried for one logical model.
+	//
+	// Keep aggregated routes at the same single candidate scan as normal routes:
+	// attemptsFor already does that scan, so a plan must not call attemptsFor and
+	// then LenRoute again. Only count candidates here when failover is possible.
+	var attempts int
+	var tierBudget int
+	if aggPlan != nil {
+		attempts = aggPlan.MaxAttempts
+		if attempts <= 0 {
+			attempts = 1
+		}
+		if !aggPlan.AllowFallbacks {
+			attempts = 1
+		} else if aggPlan.Strategy == accounts.AggregationPriority {
+			// LiteLLM-style ordered fallback: each order tier gets its own
+			// retry budget before escalating to the next tier. A global budget
+			// would otherwise be spent entirely on sibling accounts of the
+			// first provider when MaxAttempts is smaller than that provider's
+			// account count.
+			tierBudget = attempts
+			attempts *= aggPlan.PriorityTierCount()
+			if e.Pool != nil {
+				query := e.routeQuery("", providerFilter, regionFilter, req.Model, allowed, nil, nil, aggPlan)
+				if n := e.Pool.LenRoute(query); n > 0 && n < attempts {
+					attempts = n
+				}
+			}
+		} else if e.Pool != nil {
+			query := e.routeQuery("", providerFilter, regionFilter, req.Model, allowed, nil, nil, aggPlan)
+			if n := e.Pool.LenRoute(query); n > 0 && n < attempts {
+				attempts = n
+			}
+		}
+	} else {
+		attempts = e.attemptsFor(providerFilter, regionFilter, req.Model, allowed, nil)
 	}
 	loop := routeLoop{
 		requestID:      RequestIDFromContext(ctx),
@@ -922,7 +1064,13 @@ func (e ChatExecutor) newRouteLoop(ctx context.Context, prefer, providerFilter s
 		routing:        routing,
 		excluded:       map[string]struct{}{},
 		allowed:        allowed,
-		attempts:       e.attemptsFor(providerFilter, regionFilter, req.Model, allowed, nil),
+		resolver:       resolver,
+		plan:           aggPlan,
+		attempts:       attempts,
+	}
+	if tierBudget > 0 {
+		loop.tierAttempts = make(map[int]int)
+		loop.tierBudget = tierBudget
 	}
 	if routing.Source == routingPin {
 		loop.pinned = prefer
@@ -931,7 +1079,7 @@ func (e ChatExecutor) newRouteLoop(ctx context.Context, prefer, providerFilter s
 }
 
 func (l *routeLoop) pickNext(e ChatExecutor, publicModel string) (Item, int, error) {
-	item, err := e.pick(l.requestID, l.prefer, l.providerFilter, l.regionFilter, publicModel, l.allowed, l.excluded, l.eligible)
+	item, err := e.pick(l.requestID, l.prefer, l.providerFilter, l.regionFilter, publicModel, l.allowed, l.excluded, l.eligible, l.plan)
 	if err != nil {
 		// Sticky routing pins the bound provider and region before this pick.
 		// A capacity check made before the pick races the slot: another request
@@ -947,8 +1095,9 @@ func (l *routeLoop) pickNext(e ChatExecutor, publicModel string) (Item, int, err
 			l.prefer = ""
 			l.providerFilter = ""
 			l.regionFilter = ""
-			l.attempts = e.attemptsFor(l.providerFilter, l.regionFilter, publicModel, l.allowed, l.eligible)
-			item, err = e.pick(l.requestID, l.prefer, l.providerFilter, l.regionFilter, publicModel, l.allowed, l.excluded, l.eligible)
+			l.regionPinned = false
+			l.attempts = e.attemptsFor(l.providerFilter, l.regionFilter, publicModel, l.allowed, l.eligible, l.resolver)
+			item, err = e.pick(l.requestID, l.prefer, l.providerFilter, l.regionFilter, publicModel, l.allowed, l.excluded, l.eligible, l.plan)
 		}
 		if err != nil {
 			return Item{}, l.index, err
@@ -957,12 +1106,39 @@ func (l *routeLoop) pickNext(e ChatExecutor, publicModel string) (Item, int, err
 	attemptIndex := l.index
 	e.observeRouting(&l.routing, item.ID)
 	l.prefer = ""
-	if l.regionFilter == "" {
+	// Pin the first pick's region so a mixed-region pool does not flip regions
+	// while rotating within one request. The attempt budget was computed over
+	// every eligible candidate before this pick and must not shrink here:
+	// shrinking it to the pinned region's account count can leave a failed
+	// request with no failover hop at all, even though another provider or
+	// region is healthy. A failure releases the pin in exclude/failover.
+	if l.plan == nil && l.regionFilter == "" {
 		l.regionFilter = pinRegion(l.regionFilter, item.Region)
-		l.attempts = e.attemptsFor(l.providerFilter, l.regionFilter, publicModel, l.allowed, l.eligible)
+		l.regionPinned = true
 	}
 	l.index++
 	return item, attemptIndex, nil
+}
+
+// attemptModel returns the concrete model used for this item. It is the
+// resolved real model for aggregated requests, otherwise the public model.
+// Cooldowns must be recorded against this value so different providers/models
+// behind one virtual ID do not share a cooldown.
+func (l routeLoop) attemptModel(item Item, req translate.ChatRequest) string {
+	if l.resolver != nil {
+		if model := l.resolver(item); model != "" {
+			return model
+		}
+	}
+	return req.Model
+}
+
+// dispatchRequest returns the request for this attempt with an aggregated
+// virtual model resolved to the concrete model chosen for this item. It only
+// touches the local copy of the request; the shared Item is never modified.
+func (l routeLoop) dispatchRequest(item Item, req translate.ChatRequest) translate.ChatRequest {
+	req.Model = l.attemptModel(item, req)
+	return req
 }
 
 func (l routeLoop) canFailover(classified Classified) bool {
@@ -971,6 +1147,63 @@ func (l routeLoop) canFailover(classified Classified) bool {
 
 func (l *routeLoop) exclude(item Item) {
 	l.excluded[item.ID] = struct{}{}
+	// A cross-provider route (no explicit provider filter) must be able to
+	// leave the region its first pick happened to choose; otherwise a bare
+	// model shared by several providers stays pinned to one supplier.
+	//
+	// A provider-scoped route keeps its region pin: Qoder global and CN are
+	// isolated upstreams (different catalogs/quota pools), and existing
+	// behavior explicitly forbids global -> CN failover. Aggregated routes
+	// carry their own provider/region per member and never pin here.
+	if l.regionPinned && l.providerFilter == "" {
+		l.regionFilter = ""
+		l.regionPinned = false
+	}
+}
+
+// failover records an upstream failure and excludes the account. On a
+// cross-provider route exclude also releases the implicit region pin, so the
+// next pick can leave the first supplier's region. Provider-scoped routes keep
+// their region pin.
+//
+// A sticky binding is invalidated on failover (401/429/5xx and other
+// failover-classified failures), including after a sticky escape. The next
+// request then rebinds to a healthy account instead of retrying the dead one
+// first; a successfully retried request rebinds through bindSession. This
+// mirrors mature gateways' session affinity: sticky on the cache-hit path,
+// failover invalidates the binding.
+func (l *routeLoop) failover(e ChatExecutor, item Item) {
+	l.exclude(item)
+	l.noteTierFailure(e, item)
+	// Any non-pin route that already carries a session key can have a stale
+	// binding (including a sticky-escape that started on another account).
+	// Invalidate it so the next turn does not retry the failed account first.
+	if l.routing.Source != routingPin && l.routing.SessionKey != "" && e.SessionAffinity != nil {
+		e.SessionAffinity.Forget(l.routing.SessionKey)
+	}
+}
+
+// noteTierFailure gives each priority tier its own retry budget. Once the
+// budget is consumed, the remaining accounts in that tier are excluded so the
+// next pick can reach a lower-priority provider instead of retrying every
+// sibling account of the same provider.
+func (l *routeLoop) noteTierFailure(e ChatExecutor, item Item) {
+	if l.plan == nil || l.plan.Strategy != accounts.AggregationPriority || l.tierAttempts == nil || e.Pool == nil {
+		return
+	}
+	tier, ok := l.plan.Priority(item)
+	if !ok {
+		return
+	}
+	l.tierAttempts[tier]++
+	if l.tierAttempts[tier] < l.tierBudget {
+		return
+	}
+	for _, candidate := range e.Pool.Items() {
+		if candidateTier, ok := l.plan.Priority(candidate); ok && candidateTier == tier {
+			l.excluded[candidate.ID] = struct{}{}
+		}
+	}
 }
 
 func (l routeLoop) headerAccount(item Item, attemptIndex int) string {
@@ -1063,11 +1296,14 @@ func (e ChatExecutor) ChatNonStream(ctx context.Context, req translate.ChatReque
 		}
 		release := func() { e.releaseInFlight(loop.requestID, poolID) }
 		if isInProcessItem(item) || e.qoderDirect(item) {
-			result, classified, err := e.chatInProcessNonStreamAttempt(ctx, item, req, i)
+			result, classified, err := e.chatInProcessNonStreamAttempt(ctx, item, loop.dispatchRequest(item, req), i)
 			if err == nil {
 				result.AttemptCount = i + 1
-				e.observeRouting(&loop.routing, result.AccountID)
-				e.bindSession(loop.routing, result.AccountID)
+				e.observeRouting(&loop.routing, poolID)
+				// Bind the pool account, not the upstream-reported label. A
+				// worker response may rewrite X-Qoder-Account, but session
+				// affinity and future Pool.ByID lookups are keyed by the pool ID.
+				e.bindSession(loop.routing, poolID)
 				release()
 				return result, nil
 			}
@@ -1078,13 +1314,13 @@ func (e ChatExecutor) ChatNonStream(ctx context.Context, req translate.ChatReque
 			}
 			if loop.canFailover(classified) {
 				release()
-				loop.exclude(item)
+				loop.failover(e, item)
 				continue
 			}
 			release()
 			return ChatResult{AttemptCount: i + 1, AccountID: item.ID, Provider: item.Provider}, err
 		}
-		payload, err := json.Marshal(buildWorkerChatPayload(req, false))
+		payload, err := json.Marshal(buildWorkerChatPayload(sanitizeForItem(item, loop.dispatchRequest(item, req)), false))
 		if err != nil {
 			release()
 			return ChatResult{}, err
@@ -1109,14 +1345,14 @@ func (e ChatExecutor) ChatNonStream(ctx context.Context, req translate.ChatReque
 			}
 			classified := Classify(0, err.Error(), "", accounts.KindUnavailable, "")
 			loop.lastErr = NewExecutionError(classified, fmt.Errorf("worker %s request failed: %w", item.ID, err))
-			e.markClassified(item.ID, classified, req.Model)
+			e.markClassified(item.ID, classified, loop.attemptModel(item, req))
 			latency := int(time.Since(started).Milliseconds())
 			e.recordAttempt(ctx, accounts.RequestAttempt{
 				AttemptIndex: i, AccountID: item.ID, StartedAt: started, FinishedAt: ptrTime(time.Now().UTC()),
 				Status: accounts.AttemptStatusFailover, ErrorKind: classified.Kind, ErrorMessage: loop.lastErr.Error(), LatencyMs: &latency,
 			})
 			release()
-			loop.exclude(item)
+			loop.failover(e, item)
 			continue
 		}
 		// Non-stream worker responses are buffered whole; cap them so a
@@ -1128,18 +1364,20 @@ func (e ChatExecutor) ChatNonStream(ctx context.Context, req translate.ChatReque
 		if account := resp.Header.Get("X-Qoder-Account"); account != "" {
 			item.ID = account
 		}
+		poolItem := item
+		poolItem.ID = poolID
 		if resp.StatusCode >= 300 {
 			msg := strings.TrimSpace(string(body))
 			classified := classifyWorkerErr(resp, msg)
 			loop.lastErr = NewExecutionError(classified, nil)
 			if classified.Kind == accounts.KindModelNotAvailable {
-				e.handleModelAvailabilityFailure(RequestIDFromContext(ctx), "worker_non_stream", item.ID, req.Model, classified)
+				e.handleModelAvailabilityFailure(RequestIDFromContext(ctx), "worker_non_stream", poolID, loop.attemptModel(item, req), classified)
 			}
-			e.markClassified(item.ID, classified, req.Model)
+			e.markClassified(poolID, classified, loop.attemptModel(item, req))
 			status := accounts.AttemptStatusError
 			if loop.canFailover(classified) {
 				status = accounts.AttemptStatusFailover
-				loop.exclude(item)
+				loop.failover(e, poolItem)
 				e.recordAttempt(ctx, accounts.RequestAttempt{
 					AttemptIndex: i, AccountID: item.ID, StartedAt: started, FinishedAt: &finished,
 					Status: status, HTTPStatus: ptrInt(resp.StatusCode), ErrorKind: classified.Kind,
@@ -1173,9 +1411,9 @@ func (e ChatExecutor) ChatNonStream(ctx context.Context, req translate.ChatReque
 		if result.ReasoningLevel != "" {
 			logResolvedReasoning(ctx, "chat_non_stream", item, req.Model, result.ReasoningLevel)
 		}
-		e.observeRouting(&loop.routing, item.ID)
-		e.bindSession(loop.routing, item.ID)
-		e.markOK(item.ID, req.Model)
+		e.observeRouting(&loop.routing, poolID)
+		e.bindSession(loop.routing, poolID)
+		e.markOK(poolID, loop.attemptModel(item, req))
 		e.recordAttempt(ctx, accounts.RequestAttempt{
 			AttemptIndex: i, AccountID: item.ID, StartedAt: started, FinishedAt: &finished,
 			Status: accounts.AttemptStatusOK, HTTPStatus: ptrInt(resp.StatusCode), LatencyMs: &latency,
@@ -1351,7 +1589,7 @@ func (e ChatExecutor) chatInProcessStreamAttempt(ctx context.Context, item Item,
 		AttemptIndex: attemptIndex, AccountID: item.ID, StartedAt: started, FinishedAt: &headerAt,
 		Status: accounts.AttemptStatusOK, HTTPStatus: ptrInt(http.StatusOK), LatencyMs: &ttfb,
 	})
-	return StreamResult{Response: resp, AccountID: item.ID, Provider: item.Provider, TTFBMs: ttfb, ReasoningLevel: resolved.ReasoningLevel, NativeResponses: nativeResponses}, Classified{}, nil
+	return StreamResult{Response: resp, AccountID: item.ID, PoolAccountID: item.ID, Provider: item.Provider, TTFBMs: ttfb, ReasoningLevel: resolved.ReasoningLevel, NativeResponses: nativeResponses}, Classified{}, nil
 }
 
 func (e ChatExecutor) classifyInProcessError(err error) Classified { return ClassifyError(err) }
@@ -1372,20 +1610,37 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
+func firstIntPtr(vals ...*int) *int {
+	for _, v := range vals {
+		if v != nil {
+			return v
+		}
+	}
+	return nil
+}
+
 func decodeChatResult(req translate.ChatRequest, body []byte) (ChatResult, error) {
 	var parsed struct {
 		Model string `json:"model"`
 		Usage struct {
-			PromptTokens         int      `json:"prompt_tokens"`
-			CompletionTokens     int      `json:"completion_tokens"`
-			CacheReadTokens      *int     `json:"cache_read_tokens"`
-			CacheWriteTokens     *int     `json:"cache_write_tokens"`
-			PromptCacheHitTokens *int     `json:"prompt_cache_hit_tokens"`
-			Source               string   `json:"source"`
-			Credits              *float64 `json:"credits"`
-			PromptDetails        struct {
+			PromptTokens             int      `json:"prompt_tokens"`
+			CompletionTokens         int      `json:"completion_tokens"`
+			CacheReadTokens          *int     `json:"cache_read_tokens"`
+			CacheReadInputTokens     *int     `json:"cache_read_input_tokens"`
+			CachedTokens             *int     `json:"cached_tokens"`
+			CachedContentTokenCount  *int     `json:"cached_content_token_count"`
+			CacheWriteTokens         *int     `json:"cache_write_tokens"`
+			CacheCreationInputTokens *int     `json:"cache_creation_input_tokens"`
+			PromptCacheHitTokens     *int     `json:"prompt_cache_hit_tokens"`
+			Source                   string   `json:"source"`
+			Credits                  *float64 `json:"credits"`
+			PromptDetails            struct {
 				CachedTokens *int `json:"cached_tokens"`
 			} `json:"prompt_tokens_details"`
+			InputDetails struct {
+				CachedTokens     *int `json:"cached_tokens"`
+				CacheWriteTokens *int `json:"cache_write_tokens"`
+			} `json:"input_tokens_details"`
 		} `json:"usage"`
 		Choices []struct {
 			FinishReason string `json:"finish_reason"`
@@ -1421,17 +1676,21 @@ func decodeChatResult(req translate.ChatRequest, body []byte) (ChatResult, error
 	if source == "" {
 		source = "estimate"
 	}
-	cacheRead := parsed.Usage.CacheReadTokens
-	if cacheRead == nil {
-		cacheRead = parsed.Usage.PromptDetails.CachedTokens
-	}
-	if cacheRead == nil {
-		cacheRead = parsed.Usage.PromptCacheHitTokens
-	}
-	cachedTokens := parsed.Usage.PromptDetails.CachedTokens
-	if cachedTokens == nil {
-		cachedTokens = cacheRead
-	}
+	cacheRead := firstIntPtr(
+		parsed.Usage.CacheReadTokens,
+		parsed.Usage.CacheReadInputTokens,
+		parsed.Usage.PromptDetails.CachedTokens,
+		parsed.Usage.InputDetails.CachedTokens,
+		parsed.Usage.PromptCacheHitTokens,
+		parsed.Usage.CachedTokens,
+		parsed.Usage.CachedContentTokenCount,
+	)
+	cacheWrite := firstIntPtr(
+		parsed.Usage.CacheWriteTokens,
+		parsed.Usage.CacheCreationInputTokens,
+		parsed.Usage.InputDetails.CacheWriteTokens,
+	)
+	cachedTokens := firstIntPtr(parsed.Usage.PromptDetails.CachedTokens, parsed.Usage.InputDetails.CachedTokens, cacheRead)
 	return ChatResult{
 		Model:            model,
 		Content:          content,
@@ -1441,7 +1700,7 @@ func decodeChatResult(req translate.ChatRequest, body []byte) (ChatResult, error
 		PromptTokens:     parsed.Usage.PromptTokens,
 		CompletionTokens: parsed.Usage.CompletionTokens,
 		CacheReadTokens:  cacheRead,
-		CacheWriteTokens: parsed.Usage.CacheWriteTokens,
+		CacheWriteTokens: cacheWrite,
 		CachedTokens:     cachedTokens,
 		UsageSource:      source,
 		Credits:          parsed.Usage.Credits,
@@ -1488,11 +1747,18 @@ func (e ChatExecutor) NativeResponsesNonStream(ctx context.Context, req translat
 		OutputTokens: collected.OutputTokens, CachedTokens: collected.CachedTokens,
 	}
 	if err != nil {
-		e.ObserveStreamFailure(upstream.AccountID, err, req.Model)
+		e.ObserveStreamFailure(poolAccountID(upstream), err, req.Model)
 		return result, err
 	}
-	e.CommitSession(ctx, req, upstream.Routing, upstream.AccountID)
+	e.CommitSession(ctx, req, upstream.Routing, poolAccountID(upstream))
 	return result, nil
+}
+
+func poolAccountID(result StreamResult) string {
+	if strings.TrimSpace(result.PoolAccountID) != "" {
+		return result.PoolAccountID
+	}
+	return result.AccountID
 }
 
 func (e ChatExecutor) HasNativeResponsesRoute(ctx context.Context, req translate.ChatRequest, prefer, providerFilter string) bool {
@@ -1504,7 +1770,11 @@ func (e ChatExecutor) HasNativeResponsesRoute(ctx context.Context, req translate
 		adapter, ok := e.Providers.Get(itemProvider(item))
 		return ok && adapter.NativeResponses != nil
 	}
-	return e.Pool != nil && e.Pool.LenRoute(e.routeQuery(prefer, providerFilter, loop.regionFilter, req.Model, loop.allowed, nil, loop.eligible)) > 0
+	if e.Pool == nil {
+		return false
+	}
+	query := e.routeQuery(loop.prefer, loop.providerFilter, loop.regionFilter, req.Model, loop.allowed, nil, loop.eligible, loop.plan)
+	return e.Pool.LenRoute(query) > 0
 }
 
 func (e ChatExecutor) chatStreamProxy(ctx context.Context, req translate.ChatRequest, native *translate.NativeResponsesRequest, prefer, providerFilter string, preferNativeResponses bool) (result StreamResult, returnErr error) {
@@ -1517,7 +1787,7 @@ func (e ChatExecutor) chatStreamProxy(ctx context.Context, req translate.ChatReq
 			adapter, ok := e.Providers.Get(itemProvider(item))
 			return ok && adapter.NativeResponses != nil
 		}
-		loop.attempts = e.attemptsFor(loop.providerFilter, loop.regionFilter, req.Model, loop.allowed, loop.eligible)
+		loop.attempts = e.attemptsFor(loop.providerFilter, loop.regionFilter, req.Model, loop.allowed, loop.eligible, loop.resolver)
 	}
 	defer func() { result.Routing = loop.routing.Source }()
 	startedAll := time.Now()
@@ -1538,11 +1808,17 @@ func (e ChatExecutor) chatStreamProxy(ctx context.Context, req translate.ChatReq
 		}
 		release := func() { e.releaseInFlight(loop.requestID, poolID) }
 		if isInProcessItem(item) || (e.qoderDirect(item) && !(preferNativeResponses && native != nil)) {
-			result, classified, err := e.chatInProcessStreamAttempt(ctx, item, req, native, i, preferNativeResponses)
+			result, classified, err := e.chatInProcessStreamAttempt(ctx, item, loop.dispatchRequest(item, req), native, i, preferNativeResponses)
 
 			if err == nil {
 				result.AttemptCount = i + 1
-				e.observeRouting(&loop.routing, result.AccountID)
+				e.observeRouting(&loop.routing, poolID)
+				// Bind at response headers, not after the stream body ends. A
+				// follow-up turn can start while the first stream is still
+				// running; waiting for [DONE] would let it select another
+				// account and lose the prompt cache. Bind the pool ID because
+				// the upstream-reported label is not a Pool routing key.
+				e.bindSession(loop.routing, poolID)
 				result.Response = e.attachInFlightRelease(result.Response, loop.requestID, poolID)
 				return result, nil
 			}
@@ -1553,13 +1829,13 @@ func (e ChatExecutor) chatStreamProxy(ctx context.Context, req translate.ChatReq
 			}
 			if loop.canFailover(classified) {
 				release()
-				loop.exclude(item)
+				loop.failover(e, item)
 				continue
 			}
 			release()
 			return StreamResult{AttemptCount: i + 1, AccountID: item.ID, Provider: item.Provider}, err
 		}
-		payload, err := json.Marshal(buildWorkerChatPayload(req, true))
+		payload, err := json.Marshal(buildWorkerChatPayload(sanitizeForItem(item, loop.dispatchRequest(item, req)), true))
 		if err != nil {
 			release()
 			return StreamResult{}, err
@@ -1584,20 +1860,22 @@ func (e ChatExecutor) chatStreamProxy(ctx context.Context, req translate.ChatReq
 			}
 			classified := Classify(0, err.Error(), "", accounts.KindUnavailable, "")
 			loop.lastErr = NewExecutionError(classified, fmt.Errorf("worker %s stream request failed: %w", item.ID, err))
-			e.markClassified(item.ID, classified, req.Model)
+			e.markClassified(item.ID, classified, loop.attemptModel(item, req))
 			latency := int(time.Since(started).Milliseconds())
 			e.recordAttempt(ctx, accounts.RequestAttempt{
 				AttemptIndex: i, AccountID: item.ID, StartedAt: started, FinishedAt: ptrTime(time.Now().UTC()),
 				Status: accounts.AttemptStatusFailover, ErrorKind: classified.Kind, ErrorMessage: loop.lastErr.Error(), LatencyMs: &latency,
 			})
 			release()
-			loop.exclude(item)
+			loop.failover(e, item)
 			continue
 		}
 		if account := resp.Header.Get("X-Qoder-Account"); account != "" {
 			item.ID = account
 			noteStreamRoute(ctx, item.ID, loop.resultProvider(item))
 		}
+		poolItem := item
+		poolItem.ID = poolID
 		if resp.StatusCode >= 300 {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxWorkerResponseBytes))
 			resp.Body.Close()
@@ -1605,15 +1883,15 @@ func (e ChatExecutor) chatStreamProxy(ctx context.Context, req translate.ChatReq
 			classified := classifyWorkerErr(resp, msg)
 			loop.lastErr = NewExecutionError(classified, nil)
 			if classified.Kind == accounts.KindModelNotAvailable {
-				e.handleModelAvailabilityFailure(RequestIDFromContext(ctx), "worker_stream", item.ID, req.Model, classified)
+				e.handleModelAvailabilityFailure(RequestIDFromContext(ctx), "worker_stream", poolID, loop.attemptModel(item, req), classified)
 			}
-			e.markClassified(item.ID, classified, req.Model)
+			e.markClassified(poolID, classified, loop.attemptModel(item, req))
 			finished := time.Now().UTC()
 			latency := int(finished.Sub(started).Milliseconds())
 			status := accounts.AttemptStatusError
 			if loop.canFailover(classified) {
 				status = accounts.AttemptStatusFailover
-				loop.exclude(item)
+				loop.failover(e, poolItem)
 				e.recordAttempt(ctx, accounts.RequestAttempt{
 					AttemptIndex: i, AccountID: item.ID, StartedAt: started, FinishedAt: &finished,
 					Status: status, HTTPStatus: ptrInt(resp.StatusCode), ErrorKind: classified.Kind,
@@ -1649,7 +1927,7 @@ func (e ChatExecutor) chatStreamProxy(ctx context.Context, req translate.ChatReq
 				classified = Classify(0, probeErr.Error(), "", accounts.KindUnavailable, "")
 			}
 			loop.lastErr = NewExecutionError(classified, fmt.Errorf("worker %s stream failed before the first event: %w", item.ID, probeErr))
-			e.markClassified(item.ID, classified, req.Model)
+			e.markClassified(poolID, classified, loop.attemptModel(item, req))
 			finished := time.Now().UTC()
 			latency := int(finished.Sub(started).Milliseconds())
 			status := accounts.AttemptStatusError
@@ -1660,7 +1938,7 @@ func (e ChatExecutor) chatStreamProxy(ctx context.Context, req translate.ChatReq
 					Status: status, HTTPStatus: ptrInt(resp.StatusCode), ErrorKind: classified.Kind,
 					ErrorMessage: truncateErr(probeErr.Error()), LatencyMs: &latency,
 				})
-				loop.exclude(item)
+				loop.failover(e, poolItem)
 				release()
 				continue
 			}
@@ -1673,14 +1951,15 @@ func (e ChatExecutor) chatStreamProxy(ctx context.Context, req translate.ChatReq
 			return StreamResult{AttemptCount: i + 1, AccountID: item.ID, Provider: loop.resultProvider(item)}, loop.lastErr
 		}
 		resp.Body = probed
-		e.markOK(item.ID, req.Model)
+		e.markOK(poolID, loop.attemptModel(item, req))
 		ttfb := int(time.Since(startedAll).Milliseconds())
 		headerAt := time.Now().UTC()
 		e.recordAttempt(ctx, accounts.RequestAttempt{
 			AttemptIndex: i, AccountID: item.ID, StartedAt: started, FinishedAt: &headerAt,
 			Status: accounts.AttemptStatusOK, HTTPStatus: ptrInt(resp.StatusCode), LatencyMs: &ttfb,
 		})
-		e.observeRouting(&loop.routing, item.ID)
+		e.observeRouting(&loop.routing, poolID)
+		e.bindSession(loop.routing, poolID)
 		resolved := RequestedReasoningLevel(req)
 		if resolved != "" {
 			logResolvedReasoning(ctx, "chat_stream", item, req.Model, resolved)
@@ -1689,6 +1968,7 @@ func (e ChatExecutor) chatStreamProxy(ctx context.Context, req translate.ChatReq
 		return StreamResult{
 			Response:       resp,
 			AccountID:      item.ID,
+			PoolAccountID:  poolID,
 			Provider:       loop.resultProvider(item),
 			AttemptCount:   i + 1,
 			TTFBMs:         ttfb,

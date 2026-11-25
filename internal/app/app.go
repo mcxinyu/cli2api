@@ -26,9 +26,11 @@ import (
 	"github.com/caigee-cmd/cli2api/internal/providers/codex"
 	"github.com/caigee-cmd/cli2api/internal/providers/command"
 	"github.com/caigee-cmd/cli2api/internal/providers/devin"
+	"github.com/caigee-cmd/cli2api/internal/providers/doubaowork"
 	"github.com/caigee-cmd/cli2api/internal/providers/kimi"
 	"github.com/caigee-cmd/cli2api/internal/providers/kiro"
 	"github.com/caigee-cmd/cli2api/internal/providers/meta"
+	"github.com/caigee-cmd/cli2api/internal/providers/minimaxcode"
 	"github.com/caigee-cmd/cli2api/internal/providers/qoder"
 	"github.com/caigee-cmd/cli2api/internal/providers/qwenwork"
 	"github.com/caigee-cmd/cli2api/internal/providers/trae"
@@ -110,6 +112,11 @@ func New(cfg config.Config) *App {
 		TemplatePath: cfg.PlainTemplatePath, ProxyAPIKey: proxyAPIKey, ProxyURL: proxyURL,
 		MaxLogWriters: io.MultiWriter(os.Stderr, ring),
 	}, store, nil)
+	// Existing provider-region groups migrate to provider policies before the
+	// runtime starts, so workers see the same unified values on first boot.
+	if err := appsvc.NewProviderSettings(manager).SeedMissing(context.Background()); err != nil {
+		log.Printf("[provider-settings] seed existing groups: %v", err)
+	}
 	if err := manager.Start(context.Background()); err != nil {
 		panic(err)
 	}
@@ -127,9 +134,11 @@ func New(cfg config.Config) *App {
 	providerReg.Register(zhipu.NewClient(store).Adapter())
 	providerReg.Register(qwenwork.NewClient(store).Adapter())
 	providerReg.Register(kimi.NewClient(store).Adapter())
+	providerReg.Register(minimaxcode.NewClient(store).Adapter())
 	providerReg.Register(codearts.NewClient(store).Adapter())
 	providerReg.Register(kiro.NewClient(store).Adapter())
 	providerReg.Register(meta.NewClient(store).Adapter())
+	providerReg.Register(doubaowork.NewClient(store).Adapter())
 	qoderClient := qoder.NewClient()
 	qoderClient.Bind(manager.AccountURL, manager.ProxyAPIKey)
 	qoderClient.SetDirect(qoder.NewDirect(store, func(ctx context.Context, accountID string) (string, error) {

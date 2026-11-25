@@ -39,3 +39,25 @@ func TestSetUgHeadersNormalizesDeviceID(t *testing.T) {
 		t.Fatalf("missing device id must not be sent: %q", got)
 	}
 }
+
+// The catalog endpoint keys its returned model set on the IDE build identity.
+// cli2api v0.7.45 briefly advertised a newer Trae build; a direct curl with the
+// same account returned a much smaller catalog (chat_v3 45 vs 65, solo 15 vs 54)
+// and omitted newly released models. Assert the identity used by cli2api
+// v0.7.44 so the regression cannot return silently.
+func TestSetCatalogHeadersUseKnownGoodBuildIdentity(t *testing.T) {
+	header := http.Header{}
+	SetCatalogHeaders(header, Credential{AccessToken: "at"})
+
+	want := map[string]string{
+		"User-Agent":         "Trae/3.3.62",
+		"X-Ide-Version":      "3.3.62",
+		"X-Ide-Version-Code": "20260811",
+		"X-App-Version-Code": "20260811",
+	}
+	for name, expected := range want {
+		if got := header.Get(name); got != expected {
+			t.Errorf("%s=%q want %q", name, got, expected)
+		}
+	}
+}

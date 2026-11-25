@@ -23,12 +23,20 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/system/console-key", s.withConsoleKey(s.consoleHandler().HandleConsoleKey))
 	s.mux.HandleFunc("/api/keys", s.withConsoleKey(s.consoleHandler().HandleAPIKeys))
 	s.mux.HandleFunc("/api/keys/", s.withConsoleKey(s.consoleHandler().HandleAPIKeyByID))
+	s.mux.HandleFunc("/api/aggregations", s.withConsoleKey(s.consoleHandler().HandleAggregations))
+	s.mux.HandleFunc("/api/aggregations/", s.withConsoleKey(s.consoleHandler().HandleAggregationByID))
 	s.mux.HandleFunc("/api/models", s.withConsoleKey(s.consoleHandler().HandleModelsAPI))
+	s.mux.HandleFunc("/api/models/check", s.withConsoleKey(s.consoleHandler().HandleModelProbe))
 	s.mux.HandleFunc("/api/model-catalog", s.withConsoleKey(s.consoleHandler().HandleCatalogStatus))
 	s.mux.HandleFunc("/api/models/", s.withConsoleKey(s.consoleHandler().HandleModelSetting))
 	s.mux.HandleFunc("/api/providers", s.withConsoleKey(s.consoleHandler().HandleProviders))
+	s.mux.HandleFunc("/api/provider-settings", s.withConsoleKey(s.consoleHandler().HandleProviderSettings))
+	s.mux.HandleFunc("/api/provider-settings/catalog", s.withConsoleKey(s.consoleHandler().HandleProviderCatalog))
 	s.mux.HandleFunc("/api/accounts", s.withConsoleKey(s.consoleHandler().HandleAccounts))
 	s.mux.HandleFunc("/api/accounts/import", s.withConsoleKey(s.consoleHandler().HandleAccountImport))
+	s.mux.HandleFunc("/api/accounts/export", s.withConsoleKey(s.consoleHandler().HandleAccountBundleExport))
+	s.mux.HandleFunc("/api/accounts/import/bundle", s.withConsoleKey(s.consoleHandler().HandleAccountBundleImport))
+	s.mux.HandleFunc("/api/accounts/checkin-all", s.withConsoleKey(s.consoleHandler().HandleCheckinAll))
 	s.mux.HandleFunc("/api/accounts/", s.withConsoleKey(s.consoleHandler().HandleAccountByID))
 	s.mux.HandleFunc("/api/logs", s.withConsoleKey(s.consoleHandler().HandleLogs))
 	s.mux.HandleFunc("/api/logs/", s.withConsoleKey(s.consoleHandler().HandleLogs))
@@ -56,7 +64,7 @@ func (s *Server) routes() {
 			r.URL.Path != "/og-card.svg" &&
 			r.URL.Path != "/site.webmanifest" {
 			switch r.URL.Path {
-			case "/login", "/auth", "/providers", "/access", "/accounts", "/system", "/logs", "/keys", "/usage":
+			case "/login", "/auth", "/providers", "/model-pool", "/access", "/accounts", "/system", "/logs", "/keys", "/usage":
 			default:
 				http.NotFound(w, r)
 				return

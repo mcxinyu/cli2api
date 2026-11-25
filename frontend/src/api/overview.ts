@@ -106,6 +106,15 @@ export function fetchModelsCached(accountId?: string, view?: 'regional') {
   return pending
 }
 
+export function reloadModels(accountId?: string, view?: 'regional') {
+  const key = modelsMemoryKey(accountId, view)
+  modelsMemoryCache.delete(key)
+  return fetchModels(accountId, false, view).then((data) => {
+    modelsMemoryCache.set(key, { data, at: Date.now() })
+    return data
+  })
+}
+
 export function refreshModels(accountId?: string, view?: 'regional', options?: ModelFetchOptions) {
   const key = modelsMemoryKey(accountId, view)
   modelsMemoryCache.delete(key)
@@ -172,6 +181,46 @@ export function refreshAccount(accountId: string, options?: { quota?: boolean })
   return api(`/api/accounts/${encodeURIComponent(accountId)}/refresh${query}`, {
     method: 'POST',
     body: '{}',
+  })
+}
+
+export type ModelProbeAccountResult = {
+  account_id: string
+  provider?: string
+  region?: string
+  ok: boolean
+  status?: number
+  code?: string
+  kind?: string
+  message?: string
+  latency_ms: number
+}
+
+export type ModelProbeResult = {
+  model: string
+  ok: boolean
+  account_id?: string
+  provider?: string
+  status?: number
+  code?: string
+  kind?: string
+  message?: string
+  latency_ms: number
+  attempt_count?: number
+  accounts?: ModelProbeAccountResult[]
+}
+
+export type ModelProbeResponse = {
+  results: ModelProbeResult[]
+  summary: { total: number; passed: number; failed: number; skipped: number }
+  elapsed_ms: number
+}
+
+/** Send one minimal token request per model to verify real availability. */
+export function checkModels(models?: string[]) {
+  return api<ModelProbeResponse>('/api/models/check', {
+    method: 'POST',
+    body: JSON.stringify(models?.length ? { models } : {}),
   })
 }
 
@@ -470,6 +519,21 @@ export function checkinAccount(accountId: string) {
   )
 }
 
+export type CheckinAllResult = {
+  account_id: string
+  provider: string
+  region: string
+  status: string
+  message?: string
+}
+
+export function checkinAll(input?: { force?: boolean; include_disabled?: boolean }) {
+  return api<{ object?: string; data?: CheckinAllResult[] }>('/api/accounts/checkin-all', {
+    method: 'POST',
+    body: JSON.stringify(input || {}),
+  })
+}
+
 	export function fetchCheckinRecords(accountId: string) {
   return api<{ object?: string; data?: CheckinRecord[] }>(`/api/accounts/${encodeURIComponent(accountId)}/checkins`)
 }
@@ -488,4 +552,53 @@ export function importAccount(bundle: Record<string, unknown>) {
 
 export function exportAccount(accountId: string) {
   return api<Record<string, unknown>>(`/api/accounts/${encodeURIComponent(accountId)}/export`)
+}
+
+export type AccountBundle = {
+  format: string
+  version: number
+  exported_at: string
+  count: number
+  accounts: AccountBundleEntry[]
+}
+
+export type AccountBundleEntry = {
+  name: string
+  provider: string
+  region: string
+  auth_type?: string
+  enabled: boolean
+  max_inflight: number
+  priority: number
+  drop_system_prompt?: boolean
+  model_aliases?: Record<string, string>
+  enabled_models?: string[]
+  models_restricted?: boolean
+  auto_checkin?: boolean
+  checkin_time?: string
+  workbuddy_auto_checkin?: boolean
+  workbuddy_checkin_time?: string
+  proxy_url?: string
+  credential?: {
+    format: string
+    credential?: unknown
+    user_blob?: string
+    machine_id?: string
+  }
+}
+
+export type AccountImportResult = {
+  object?: string
+  succeeded?: number
+  failed?: number
+  data?: unknown[]
+  errors?: Array<{ index?: number; name?: string; message?: string }>
+}
+
+export function exportAccountBundle() {
+  return api<AccountBundle>('/api/accounts/export')
+}
+
+export function importAccountBundle(bundle: AccountBundle) {
+  return api<AccountImportResult>('/api/accounts/import/bundle', { method: 'POST', body: JSON.stringify(bundle) })
 }

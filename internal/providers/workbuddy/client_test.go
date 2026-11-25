@@ -1303,6 +1303,56 @@ func TestPrepareBodyRepairsInterruptedToolSequence(t *testing.T) {
 	}
 }
 
+func TestPrepareBodyMergesAdjacentToolCallBatches(t *testing.T) {
+	out := PrepareBody([]byte(`{"model":"m","messages":[
+			{"role":"user","content":"look this up"},
+			{"role":"assistant","content":"checking","reasoning_content":"plan","tool_calls":[{"id":"call_abc","type":"function","function":{"name":"search","arguments":"{}"}}]},
+			{"role":"assistant","content":[{"type":"text","text":"and reading"}],"reasoning_content":"next","tool_calls":[{"id":"call_def","type":"function","function":{"name":"read","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_abc","content":"one"},
+			{"role":"tool","tool_call_id":"call_def","content":"two"},
+			{"role":"user","content":"thanks"}
+		]}`))
+	var body map[string]any
+	if err := json.Unmarshal(out, &body); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(messageRoles(body), ",") != "system,user,assistant,tool,tool,user" {
+		t.Fatalf("adjacent tool batches not merged: %v", body["messages"])
+	}
+	var assistant map[string]any
+	for _, item := range body["messages"].([]any) {
+		message, _ := item.(map[string]any)
+		if messageRole(message) == "assistant" {
+			assistant = message
+		}
+	}
+	calls, _ := assistant["tool_calls"].([]any)
+	if len(calls) != 2 {
+		t.Fatalf("tool_calls=%v", assistant["tool_calls"])
+	}
+	parts, _ := assistant["content"].([]any)
+	if len(parts) != 2 {
+		t.Fatalf("content=%v", assistant["content"])
+	}
+	if stringField(assistant, "reasoning_content") != "plan\nnext" {
+		t.Fatalf("reasoning=%v", assistant["reasoning_content"])
+	}
+
+	separated := PrepareBody([]byte(`{"model":"m","messages":[
+			{"role":"user","content":"first"},
+			{"role":"assistant","content":"","tool_calls":[{"id":"call_abc","type":"function","function":{"name":"search","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_abc","content":"one"},
+			{"role":"assistant","content":"then","tool_calls":[{"id":"call_def","type":"function","function":{"name":"read","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_def","content":"two"}
+		]}`))
+	if err := json.Unmarshal(separated, &body); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(messageRoles(body), ",") != "system,user,assistant,tool,assistant,tool" {
+		t.Fatalf("separate rounds should stay separate: %v", body["messages"])
+	}
+}
+
 func messageRoles(body map[string]any) []string {
 	messages, _ := body["messages"].([]any)
 	roles := make([]string, 0, len(messages))
@@ -1496,9 +1546,11 @@ func TestChatHeadersReuseConversationIDForOneSession(t *testing.T) {
 		t.Fatalf("one session must reuse its conversation id: %s vs %s",
 			first.Get("X-Conversation-ID"), second.Get("X-Conversation-ID"))
 	}
-	if first.Get("X-Conversation-Request-ID") != first.Get("X-Conversation-ID") ||
-		first.Get("X-Root-Request-ID") != first.Get("X-Conversation-ID") {
-		t.Fatalf("turn ids must follow the conversation id: %+v", first)
+	if first.Get("X-Conversation-Request-ID") != first.Get("X-Conversation-ID") {
+		t.Fatalf("turn id must follow the conversation id: %+v", first)
+	}
+	if first.Get("X-Root-Request-ID") != "" {
+		t.Fatalf("official chat no longer sends X-Root-Request-ID: %+v", first)
 	}
 	if first.Get("X-Request-ID") == second.Get("X-Request-ID") {
 		t.Fatal("message id must be fresh per request")
@@ -1533,15 +1585,16 @@ func dashedUUID(value string) bool {
 func TestChatHeadersStayRegionSpecificAndIncludeCLIChannel(t *testing.T) {
 	cn := http.Header{}
 	SetChatHeaders(cn, Credential{AccessToken: "at", UID: "u1", Domain: "www.codebuddy.cn"}, "")
-	if cn.Get("Origin") != "https://www.codebuddy.cn" || cn.Get("Referer") != "https://www.codebuddy.cn/" {
-		t.Fatalf("CN origin/referer mixed: %+v", cn)
+	if cn.Get("Origin") != "" || cn.Get("Referer") != "" {
+		t.Fatalf("official chat must not send origin/referer: %+v", cn)
 	}
 	if got := cn.Get("User-Agent"); got != UserAgent || !strings.Contains(got, CLIVersion) {
 		t.Fatalf("CN UA=%q", got)
 	}
-	if cn.Get("X-Product") != "SaaS" || cn.Get("X-IDE-Type") != "CLI" || cn.Get("X-IDE-Version") != CLIVersion ||
+	if cn.Get("X-Product") != "SaaS" || cn.Get("X-IDE-Type") != "CLI" || cn.Get("X-IDE-Version") != DesktopVersionCN ||
 		cn.Get("X-Agent-Intent") != "craft" || cn.Get("X-Agent-Purpose") != "conversation" ||
-		cn.Get("X-Agent-Runtime") != "other" || cn.Get("X-Agent-Type") != "main" ||
+		cn.Get("X-Agent-Runtime") != "local-agent" || cn.Get("X-Agent-Type") != "main" ||
+		cn.Get("X-Client-Version") != DesktopVersionCN || cn.Get("X-Client-Product") != "WorkBuddy" ||
 		cn.Get("X-Private-Data") != "false" || cn.Get("X-Request-ID") == "" {
 		t.Fatalf("CN missing CLI channel headers: %+v", cn)
 	}
@@ -1553,7 +1606,7 @@ func TestChatHeadersStayRegionSpecificAndIncludeCLIChannel(t *testing.T) {
 		cn.Get("X-Stainless-Timeout") != "1200" {
 		t.Fatalf("CN missing CLI SDK fingerprint: %+v", cn)
 	}
-	if cn.Get("X-Request-ID") == cn.Get("X-Conversation-ID") || cn.Get("X-Root-Request-ID") != cn.Get("X-Conversation-Request-ID") {
+	if cn.Get("X-Request-ID") == cn.Get("X-Conversation-ID") || cn.Get("X-Root-Request-ID") != "" {
 		t.Fatalf("CLI request ids must split message and turn: %+v", cn)
 	}
 	if cn.Get("X-Request-ID") != cn.Get("X-Conversation-Message-ID") {
@@ -1571,8 +1624,13 @@ func TestChatHeadersStayRegionSpecificAndIncludeCLIChannel(t *testing.T) {
 
 	global := http.Header{}
 	SetChatHeaders(global, Credential{AccessToken: "at", UID: "u2", Domain: "www.workbuddy.ai"}, "")
-	if global.Get("Origin") != "https://www.workbuddy.ai" || global.Get("Referer") != "https://www.workbuddy.ai/" {
-		t.Fatalf("Global origin/referer mixed: %+v", global)
+	if global.Get("Origin") != "" || global.Get("Referer") != "" {
+		t.Fatalf("official Global chat must not send origin/referer: %+v", global)
+	}
+	if global.Get("User-Agent") != DesktopUserAgentGlobal ||
+		global.Get("X-Client-Version") != DesktopVersionGlobal ||
+		global.Get("X-Client-Product") != "workbuddy-ai" {
+		t.Fatalf("Global chat identity=%+v", global)
 	}
 	if global.Get("X-IDE-Type") != "CLI" || global.Get("X-Product") != "SaaS" {
 		t.Fatalf("Global missing CLI channel headers: %+v", global)

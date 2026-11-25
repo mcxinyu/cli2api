@@ -98,7 +98,7 @@ var Qoder = ProviderDescriptor{
 	},
 	Regions: []RegionDescriptor{
 		{
-			ID: "global", Label: "Global", ChatBase: "https://api1.qoder.sh",
+			ID: "global", Label: "Global", ChatBase: "https://api2.qoder.sh",
 			BillingBase: "https://openapi.qoder.sh", AuthBase: "https://qoder.sh",
 			DefaultDomain: "qoder.global",
 			Checkin:       &CheckinPolicy{Timezone: "Asia/Shanghai"},
@@ -128,16 +128,15 @@ var WorkBuddy = ProviderDescriptor{
 	},
 	Regions: []RegionDescriptor{
 		{
-			ID: "cn", Label: "CN", ChatBase: "https://copilot.tencent.com",
-			BillingBase: "https://www.codebuddy.cn", AuthBase: "https://copilot.tencent.com",
+			ID: "cn", Label: "CN", ChatBase: "https://www.workbuddy.cn",
+			BillingBase: "https://www.workbuddy.cn", AuthBase: "https://www.workbuddy.cn",
 			DefaultDomain: "codebuddy.cn",
-			Checkin:       &CheckinPolicy{Timezone: "Local"},
+			Checkin:       &CheckinPolicy{Timezone: "Asia/Shanghai"},
 		},
 		{
 			ID: "global", Label: "Global", ChatBase: "https://www.workbuddy.ai",
 			BillingBase: "https://www.workbuddy.ai", AuthBase: "https://www.workbuddy.ai",
 			DefaultDomain: "workbuddy.ai",
-			Checkin:       &CheckinPolicy{Timezone: "Local"},
 		},
 	},
 	DefaultRegion: "cn",
@@ -361,11 +360,11 @@ var Kiro = ProviderDescriptor{
 	Runtime:           RuntimeInProcess,
 	AuthTypes:         []AuthType{AuthOAuth, AuthPAT},
 	CredentialFormats: []string{"kiro-oauth-v1"},
-		Capabilities: ProviderCapabilities{
-			Chat: true, Stream: true, Tools: true, Images: true, Reasoning: true,
-			ModelCatalog: true, Usage: false, Login: true, BrowserLogin: true,
-			PATLogin: true, ImportExport: true,
-		},
+	Capabilities: ProviderCapabilities{
+		Chat: true, Stream: true, Tools: true, Images: true, Reasoning: true,
+		ModelCatalog: true, Usage: false, Login: true, BrowserLogin: true,
+		PATLogin: true, ImportExport: true,
+	},
 	Regions: []RegionDescriptor{
 		{
 			ID: "us-east-1", Label: "US East",
@@ -406,19 +405,79 @@ var Meta = ProviderDescriptor{
 	DefaultRegion: "global",
 }
 
+// DoubaoWork descriptor. Protocol constants stay in internal/providers/doubaowork;
+// the registry only carries control-plane metadata. CN-only in-process adapter
+// for the Doubao Work (豆包工作) desktop subscription. Auth is a pasted web
+// session Cookie: the server runs headless, so there is no browser or client
+// login round, only an operator-pasted credential validated on import.
+var DoubaoWork = ProviderDescriptor{
+	ID:                "doubaowork",
+	Label:             "Doubao Work",
+	Runtime:           RuntimeInProcess,
+	AuthTypes:         []AuthType{AuthPAT},
+	CredentialFormats: []string{"doubaowork-cookie-v1"},
+	Capabilities: ProviderCapabilities{
+		Chat: true, Stream: true, Tools: true, Images: false, Reasoning: true,
+		ModelCatalog: true, Usage: true, Login: false, BrowserLogin: false,
+		PATLogin: true, ImportExport: true,
+	},
+	Regions: []RegionDescriptor{
+		{
+			ID: "cn", Label: "CN", ChatBase: "https://www.doubao.com",
+			BillingBase: "https://www.doubao.com", AuthBase: "https://www.doubao.com",
+			DefaultDomain: "doubao.com",
+			Checkin:       &CheckinPolicy{Timezone: "Asia/Shanghai"},
+		},
+	},
+	DefaultRegion: "cn",
+}
+
+// MiniMaxCode is the MiniMax Code subscription product, reached through its
+// OAuth device flow and Anthropic-compatible agent gateway. It is distinct
+// from the MiniMax Open Platform API-key gateway.
+var MiniMaxCode = ProviderDescriptor{
+	ID:                "minimaxcode",
+	Label:             "MiniMax Code",
+	Runtime:           RuntimeInProcess,
+	AuthTypes:         []AuthType{AuthOAuth},
+	CredentialFormats: []string{"minimaxcode-oauth-v1"},
+	Capabilities: ProviderCapabilities{
+		Chat: true, Stream: true, Tools: true, Images: true, Reasoning: false,
+		ModelCatalog: true, Usage: true, Login: true, BrowserLogin: true,
+		PATLogin: false, ImportExport: true,
+	},
+	Regions: []RegionDescriptor{
+		{
+			ID: "cn", Label: "CN", ChatBase: "https://agent.minimax.cn",
+			BillingBase: "https://agent.minimax.cn", AuthBase: "https://account.minimax.cn",
+			DefaultDomain: "minimax.cn",
+			Checkin:       &CheckinPolicy{Timezone: "Asia/Shanghai"},
+		},
+		{
+			ID: "global", Label: "Global", ChatBase: "https://agent.minimax.io",
+			BillingBase: "https://agent.minimax.io", AuthBase: "https://account.minimax.io",
+			DefaultDomain: "minimax.io",
+			Checkin:       &CheckinPolicy{Timezone: "Asia/Shanghai"},
+		},
+	},
+	DefaultRegion: "cn",
+}
+
 var registry = map[string]ProviderDescriptor{
-	Qoder.ID:     Qoder,
-	WorkBuddy.ID: WorkBuddy,
-	Trae.ID:      Trae,
-	Devin.ID:     Devin,
-	Command.ID:   Command,
-	Codex.ID:     Codex,
-	Zhipu.ID:     Zhipu,
-	QwenWork.ID:  QwenWork,
-	Kimi.ID:      Kimi,
-	CodeArts.ID:  CodeArts,
-	Kiro.ID:      Kiro,
-	Meta.ID:      Meta,
+	Qoder.ID:       Qoder,
+	WorkBuddy.ID:   WorkBuddy,
+	Trae.ID:        Trae,
+	Devin.ID:       Devin,
+	Command.ID:     Command,
+	Codex.ID:       Codex,
+	Zhipu.ID:       Zhipu,
+	QwenWork.ID:    QwenWork,
+	Kimi.ID:        Kimi,
+	CodeArts.ID:    CodeArts,
+	Kiro.ID:        Kiro,
+	Meta.ID:        Meta,
+	DoubaoWork.ID:  DoubaoWork,
+	MiniMaxCode.ID: MiniMaxCode,
 }
 
 func Get(id string) (ProviderDescriptor, bool) {
@@ -431,7 +490,7 @@ func Get(id string) (ProviderDescriptor, bool) {
 }
 
 func List() []ProviderDescriptor {
-	return []ProviderDescriptor{Qoder, WorkBuddy, Trae, Devin, Command, Codex, Zhipu, QwenWork, Kimi, CodeArts, Kiro, Meta}
+	return []ProviderDescriptor{Qoder, WorkBuddy, Trae, Devin, Command, Codex, Zhipu, QwenWork, Kimi, CodeArts, Kiro, Meta, DoubaoWork, MiniMaxCode}
 }
 
 // Resolve validates a provider/region pair. Empty values fall back to the

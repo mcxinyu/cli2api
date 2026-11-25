@@ -200,7 +200,9 @@ func (c *Client) listProfilesInRegion(ctx context.Context, client *http.Client, 
 	var profiles []string
 	next := ""
 	for page := 0; page < maxProfilePages; page++ {
-		body := map[string]any{"maxResults": 50}
+		// ListAvailableProfiles currently rejects values above 10, even though the
+		// model endpoint accepts 50. Keep this request at the service limit.
+		body := map[string]any{"maxResults": 10}
 		if next != "" {
 			body["nextToken"] = next
 		}
@@ -363,7 +365,9 @@ func (c *Client) rememberIdentity(ctx context.Context, accountID string, cred Cr
 func quotaFromUsage(usage usageLimits, fetchedAt time.Time) *providers.QuotaInfo {
 	breakdown := creditBreakdown(usage.UsageBreakdownList)
 	unit := "credits"
-	if breakdown != nil {
+	// The CREDIT breakdown is metered in credits even though Kiro labels its
+	// unit INVOCATIONS; other resource types keep the unit Kiro states.
+	if breakdown != nil && !strings.EqualFold(breakdown.ResourceType, "CREDIT") {
 		unit = firstNonEmpty(strings.TrimSpace(breakdown.Unit), strings.TrimSpace(breakdown.Currency), "credits")
 	}
 	info := &providers.QuotaInfo{
@@ -473,7 +477,7 @@ func subscriptionPlan(usage usageLimits) string {
 	}
 	raw := strings.ToUpper(firstNonEmpty(usage.SubscriptionInfo.SubscriptionTitle, usage.SubscriptionInfo.SubscriptionName, usage.SubscriptionInfo.SubscriptionType))
 	switch {
-	case strings.Contains(raw, "PRO_PLUS"), strings.Contains(raw, "PROPLUS"):
+	case strings.Contains(raw, "PRO_PLUS"), strings.Contains(raw, "PROPLUS"), strings.Contains(raw, "PRO+"):
 		return "PRO_PLUS"
 	case strings.Contains(raw, "POWER"):
 		return "POWER"

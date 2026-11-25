@@ -265,6 +265,126 @@ func TestFilterModelsByAccountAllowDropsModelsNoGrantedAccountServes(t *testing.
 	}
 }
 
+func TestFilterModelsByAccountAllowHonorsAuto(t *testing.T) {
+	models := []map[string]any{
+		{"id": "auto", "provider": "qoder", "regions": []string{"cn"}},
+		{"id": "deepseek-flash", "provider": "qoder", "regions": []string{"cn"}},
+		{"id": "glm-5.3-flash", "provider": "qoder", "regions": []string{"cn"}},
+	}
+	key := auth.Identity{Kind: auth.KindKey, AllowedProviders: []string{"qoder"}}
+	ids := func(filtered []map[string]any) map[string]bool {
+		seen := map[string]bool{}
+		for _, model := range filtered {
+			id, _ := model["id"].(string)
+			seen[id] = true
+		}
+		return seen
+	}
+
+	restricted := []AccountModelAllow{{
+		Provider: "qoder", Region: "cn", ModelsRestricted: true,
+		EnabledModels: []string{"deepseek-flash", "glm-5.3-flash"},
+	}}
+	got := FilterModelsByAccountAllow(models, key, restricted)
+	if len(got) != 2 || ids(got)["auto"] || !ids(got)["deepseek-flash"] || !ids(got)["glm-5.3-flash"] {
+		t.Fatalf("restricted auto leaked: %v", ids(got))
+	}
+
+	autoEnabled := []AccountModelAllow{{
+		Provider: "qoder", Region: "cn", ModelsRestricted: true,
+		EnabledModels: []string{"deepseek-flash", "auto"},
+	}}
+	if got := ids(FilterModelsByAccountAllow(models, key, autoEnabled)); !got["auto"] || !got["deepseek-flash"] || got["glm-5.3-flash"] {
+		t.Fatalf("enabled auto filtered: %v", got)
+	}
+
+	unrestricted := []AccountModelAllow{{Provider: "qoder", Region: "cn"}}
+	if got := ids(FilterModelsByAccountAllow(models, key, unrestricted)); len(got) != 3 || !got["auto"] {
+		t.Fatalf("unrestricted auto hidden: %v", got)
+	}
+}
+
+func TestExpandModelAliasesAddsPublicAlias(t *testing.T) {
+	models := []map[string]any{
+		{"id": "kimi-k2.6", "provider": "qoder", "regions": []string{"global"}, "native_model": "kimi-native-q"},
+		{"id": "kimi-k2.5", "provider": "workbuddy", "regions": []string{"cn"}, "native_model": "kimi-native-w"},
+	}
+	pool := []AccountModelAllow{
+		{Provider: "qoder", Region: "global", ModelsRestricted: true, EnabledModels: []string{"kimi-k2.6"}, Aliases: map[string]string{"kimi-k3": "kimi-k2.6"}},
+		{Provider: "workbuddy", Region: "cn", ModelsRestricted: true, EnabledModels: []string{"kimi-k2.5"}, Aliases: map[string]string{"kimi-k3": "kimi-k2.5"}},
+	}
+	got := ExpandModelAliases(models, pool)
+	if len(got) != 4 {
+		t.Fatalf("expanded len=%d %v", len(got), got)
+	}
+	byProvider := map[string]map[string]any{}
+	for _, entry := range got {
+		id, _ := entry["id"].(string)
+		if id == "kimi-k3" {
+			byProvider[modelEntryProvider(entry)] = entry
+		}
+	}
+	if byProvider["qoder"]["alias_of"] != "kimi-k2.6" || byProvider["workbuddy"]["alias_of"] != "kimi-k2.5" {
+		t.Fatalf("alias providers=%v", byProvider)
+	}
+	if byProvider["qoder"]["display_name"] != "kimi-k3" {
+		t.Fatalf("display name=%v", byProvider["qoder"])
+	}
+	visible := FilterModelsByAccountAllow(got, auth.Identity{Kind: auth.KindKey, AllowedProviders: []string{"qoder"}}, pool)
+	ids := map[string]bool{}
+	for _, entry := range visible {
+		id, _ := entry["id"].(string)
+		ids[id] = true
+	}
+	if !ids["kimi-k2.6"] || !ids["kimi-k3"] || ids["kimi-k2.5"] {
+		t.Fatalf("alias visibility=%v", ids)
+	}
+
+	// A real catalog entry wins over an alias with the same id.
+	withReal := append(models, map[string]any{"id": "kimi-k3", "provider": "qoder"})
+	if n := len(ExpandModelAliases(withReal, pool)); n != 3 {
+		t.Fatalf("real id did not win: %d", n)
+	}
+	// A disabled target contributes no public alias.
+	disabled := []AccountModelAllow{{
+		Provider: "qoder", Region: "global", ModelsRestricted: true,
+		EnabledModels: []string{"other"}, Aliases: map[string]string{"kimi-k3": "kimi-k2.6"},
+	}}
+	if n := len(ExpandModelAliases(models, disabled)); n != 2 {
+		t.Fatalf("disabled target expanded: %d", n)
+	}
+}
+
+func TestAggregateModelEntriesFoldsProviderAliases(t *testing.T) {
+	models := []map[string]any{
+		{"id": "kimi-k2.6", "provider": "qoder", "regions": []string{"global"}, "native_model": "kimi-native-q"},
+		{"id": "kimi-k2.5", "provider": "workbuddy", "regions": []string{"cn"}, "native_model": "kimi-native-w"},
+	}
+	pool := []AccountModelAllow{
+		{Provider: "qoder", Region: "global", ModelsRestricted: true, EnabledModels: []string{"kimi-k2.6"}, Aliases: map[string]string{"kimi-k3": "kimi-k2.6"}},
+		{Provider: "workbuddy", Region: "cn", ModelsRestricted: true, EnabledModels: []string{"kimi-k2.5"}, Aliases: map[string]string{"kimi-k3": "kimi-k2.5"}},
+	}
+	identity := auth.Identity{Kind: auth.KindKey, ModelAggregation: true}
+	visible := FilterModelsForIdentity(identity, FilterModelsByAccountAllow(ExpandModelAliases(models, pool), identity, pool))
+	aggregated := AggregateModelEntries(visible, identity, pool)
+	if len(aggregated) != 1 {
+		t.Fatalf("aggregated=%v", aggregated)
+	}
+	entry := aggregated[0]
+	if entry["id"] != "kimi-k3" || entry["owned_by"] != "aggregate" || entry["display_name"] != "kimi-k3" {
+		t.Fatalf("aggregated entry=%v", entry)
+	}
+	for _, field := range []string{"provider", "native_model", "alias_of", "regions"} {
+		if _, present := entry[field]; present {
+			t.Fatalf("%s leaked: %v", field, entry)
+		}
+	}
+	// A key without the switch keeps the normal catalog view.
+	if plain := AggregateModelEntries(visible, auth.Identity{Kind: auth.KindKey}, pool); len(plain) != len(visible) {
+		t.Fatalf("plain key list changed: %v", plain)
+	}
+}
+
 func TestFilterModelsForIdentityDropsDisallowedProviderAndRegion(t *testing.T) {
 	models := []map[string]any{
 		{"id": "glm-5.2", "provider": "qoder", "regions": []string{"cn"}},

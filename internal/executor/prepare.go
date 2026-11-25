@@ -38,6 +38,13 @@ type CatalogPreparer interface {
 	EnsureModelCatalogs(ctx context.Context, force bool)
 }
 
+// AggregationResolver resolves a logical model ID to a read-only snapshot of
+// its provider/model members. Implemented by control.Aggregations and injected
+// by the gateway. The executor never imports control directly.
+type AggregationResolver interface {
+	Resolve(ctx context.Context, id string, allowedProviders map[string]bool) (accounts.Aggregation, error)
+}
+
 type RequestStarter interface {
 	Start(entry accounts.RequestLog)
 }
@@ -62,11 +69,15 @@ type PrepareInput struct {
 	SessionHeader     string
 	ConversationID    string
 	CrossProviderPool bool
-	Now               time.Time
-	NewRequestID      func() string
-	ModelContexts     ModelContextStore
-	Catalogs          CatalogPreparer
-	Logs              RequestStarter
+	// ModelAggregation lets a key call bare aggregate aliases even when the
+	// cross-provider pool setting is off. Only account-defined aliases qualify.
+	ModelAggregation bool
+	Now              time.Time
+	NewRequestID     func() string
+	ModelContexts    ModelContextStore
+	Catalogs         CatalogPreparer
+	Aggregations     AggregationResolver
+	Logs             RequestStarter
 }
 
 type PreparedRequest struct {
@@ -91,14 +102,36 @@ func (e ChatExecutor) Prepare(in PrepareInput) (PreparedRequest, error) {
 		request.Model = publicModel
 		request.Stream = in.NativeRequest.Stream()
 	}
-	if RejectsBareModel(publicModel, in.CrossProviderPool) {
+	if in.ModelAggregation {
+		// An aggregation key's contract is stricter than the shared pool: it may
+		// only call the provider-neutral aliases its own accounts define. A real
+		// catalog id or a provider-prefixed id would leak the split view back.
+		if strings.Contains(strings.TrimSpace(publicModel), "/") || !e.servesAggregationAlias(publicModel, in.Identity) {
+			return PreparedRequest{}, &PrepareError{
+				Status:  400,
+				Code:    "model_not_aggregated",
+				Message: "this API key only accepts its aggregated model names; call /v1/models for the list",
+			}
+		}
+	} else if RejectsBareModel(publicModel, in.CrossProviderPool) {
 		return PreparedRequest{}, &PrepareError{
 			Status:  400,
 			Code:    "provider_prefix_required",
 			Message: "cross-provider model pool is disabled; use a provider-prefixed model ID such as qoder/glm-5.2",
 		}
 	}
-	providerFilter, modelRegion := ResolveProviderFilter(&request, in.CrossProviderPool)
+	// Resolve a logical aggregation model into an immutable per-request plan.
+	// This happens once, before any Pool lock, and the plan is carried in the
+	// context so routing uses a stable snapshot (no DB/facade access under lock,
+	// no cross-request mutable state).
+	var aggregatePlan *AggregatePlan
+	if in.Aggregations != nil && (in.CrossProviderPool || in.ModelAggregation) && ProviderPrefix(publicModel) == "" {
+		if plan, ok := e.resolveAggregation(in.Context, in.Aggregations, publicModel, in.Identity.AllowedProviders); ok {
+			aggregatePlan = plan
+		}
+	}
+
+	providerFilter, modelRegion := ResolveProviderFilter(&request, in.CrossProviderPool || in.ModelAggregation)
 	prefer := strings.TrimSpace(in.PreferAccount)
 	providerFilter = ApplyPinnedProviderFilter(e.Pool, providerFilter, publicModel, prefer)
 	if providerFilter != "" && !in.Identity.AllowsProvider(providerFilter) {
@@ -147,7 +180,13 @@ func (e ChatExecutor) Prepare(in PrepareInput) (PreparedRequest, error) {
 			MessageRoles:        translate.MessageRoles(request.Messages),
 		})
 	}
-	ctx := WithAllowedProviders(WithRequestID(in.Context, requestID), in.Identity.AllowedProviders)
+	effectiveAllow := in.Identity.AllowedProviders
+	if aggregatePlan != nil && accounts.IsAggregationOnly(in.Identity.AllowedProviders) {
+		// The sentinel grant must not filter real member accounts at the pool
+		// layer; membership is already constrained by the resolved plan.
+		effectiveAllow = nil
+	}
+	ctx := WithAllowedProviders(WithRequestID(in.Context, requestID), effectiveAllow)
 	sessionKey := sessionKeyFor(in.SessionHeader, in.ConversationID, in.Identity, request)
 	if sessionKey == "" && in.NativeRequest != nil {
 		sessionKey = NativeSessionKeyFor(in.NativeRequest, in.Identity)
@@ -171,6 +210,9 @@ func (e ChatExecutor) Prepare(in PrepareInput) (PreparedRequest, error) {
 	}
 	if requestedReasoning != "" {
 		log.Printf("request reasoning request_id=%q model=%q level=%q", requestID, request.Model, requestedReasoning)
+	}
+	if aggregatePlan != nil {
+		ctx = WithAggregatePlan(ctx, aggregatePlan)
 	}
 	if sessionKey != "" && sessionAffinityDebugOn() {
 		source := "content-seed"
@@ -196,11 +238,41 @@ func (e ChatExecutor) Prepare(in PrepareInput) (PreparedRequest, error) {
 	}, nil
 }
 
+// resolveAggregation attempts to resolve a bare public model ID as a logical
+// aggregation model. It returns false for ordinary models so the normal route
+// path is unchanged. Provider grants are reduced to a family set used to
+// filter members; an empty allowlist means "all providers allowed" (nil map).
+func (e ChatExecutor) resolveAggregation(ctx context.Context, resolver AggregationResolver, model string, grants []string) (*AggregatePlan, bool) {
+	allowed := map[string]bool(nil)
+	// An aggregation-only key must not filter members by its own sentinel
+	// grant (that would drop every real provider). nil means "no member
+	// filtering"; the pool-level allowlist is cleared for these requests too.
+	if accounts.IsAggregationOnly(grants) {
+		allowed = nil
+	} else if len(grants) > 0 {
+		allowed = make(map[string]bool, len(grants))
+		for _, entry := range grants {
+			// ParseProviderGrant already lowercases and trims; do not pre-fold
+			// here so malformed entries keep their strict fail-closed behavior.
+			grant, err := accounts.ParseProviderGrant(entry)
+			if err != nil || grant.Provider == accounts.AggregationProvider {
+				continue
+			}
+			allowed[grant.Provider] = true
+		}
+	}
+	agg, err := resolver.Resolve(ctx, model, allowed)
+	if err != nil || len(agg.Members) == 0 {
+		return nil, false
+	}
+	return NewAggregatePlan(agg), true
+}
+
 // providerPrefixes are the provider segments a client may pin with a leading
 // "<provider>/" model id. Command Code's own model ids are org-namespaced
 // ("deepseek/…", "moonshotai/…"), so its provider prefix sits in front of an
 // already-namespaced id ("command/deepseek/…").
-var providerPrefixes = []string{"qoder/", "workbuddy/", "trae/", "devin/", "command/", "codex/", "zhipu/", "qwenwork/", "kimi/", "codearts/", "kiro/"}
+var providerPrefixes = []string{"qoder/", "workbuddy/", "trae/", "devin/", "command/", "codex/", "zhipu/", "qwenwork/", "kimi/", "codearts/", "kiro/", "meta/", "muse/", "doubaowork/", "minimaxcode/"}
 
 // regionDashSuffixes are the region qualifiers that may be appended to a
 // provider prefix with a dash: "workbuddy-cn/", "workbuddy-gl/",
@@ -242,6 +314,31 @@ func RejectsBareModel(model string, crossProviderPool bool) bool {
 	return strings.TrimSpace(model) != "" && !crossProviderPool && ProviderPrefix(model) == ""
 }
 
+// servesAggregationAlias reports whether a granted account defines this public
+// alias and can actually serve its target. The model list uses the same
+// account view, so an aggregation key cannot call a name it cannot see.
+func (e ChatExecutor) servesAggregationAlias(model string, identity auth.Identity) bool {
+	if e.Pool == nil {
+		return false
+	}
+	want := routeModel(model)
+	if want == "" || want == "auto" {
+		return false
+	}
+	for _, item := range e.Pool.Items() {
+		if !identity.AllowsProvider(item.Provider) || !identity.AllowsProviderRegion(item.Provider, item.Region) {
+			continue
+		}
+		if strings.TrimSpace(item.ModelAliases[want]) == "" {
+			continue
+		}
+		if itemHasModel(item, want) {
+			return true
+		}
+	}
+	return false
+}
+
 // ResolveProviderFilter parses the provider prefix (and an optional region
 // qualifier) from the model id, strips both from req.Model, and returns the
 // provider family and the canonical region ("" when no region was specified).
@@ -265,13 +362,13 @@ func ResolveProviderFilter(req *translate.ChatRequest, crossProviderPool bool) (
 		for _, rs := range regionDashSuffixes {
 			if strings.HasPrefix(model, base+rs) {
 				req.Model = strings.TrimPrefix(model, base+rs)
-				return base, regionAliases[regionTag(rs)]
+				return accounts.NormalizeProviderFamily(base), regionAliases[regionTag(rs)]
 			}
 		}
 		// Standard form: "workbuddy/model"
 		if strings.HasPrefix(model, prefix) {
 			req.Model = strings.TrimPrefix(model, prefix)
-			return base, ""
+			return accounts.NormalizeProviderFamily(base), ""
 		}
 	}
 	if crossProviderPool {
@@ -345,42 +442,7 @@ func SessionKeyFor(header string, identity auth.Identity, req translate.ChatRequ
 // normalized to the provider-neutral vocabulary. Empty when the request did
 // not specify one.
 func RequestedReasoningLevel(req translate.ChatRequest) string {
-	if len(req.ReasoningEffort) > 0 {
-		var value any
-		if json.Unmarshal(req.ReasoningEffort, &value) == nil {
-			switch typed := value.(type) {
-			case string:
-				return providers.NormalizeReasoningLevel(typed)
-			case map[string]any:
-				for _, key := range []string{"effort", "level", "type"} {
-					if text, ok := typed[key].(string); ok {
-						if level := providers.NormalizeReasoningLevel(text); level != "" {
-							return level
-						}
-					}
-				}
-			}
-		}
-	}
-	if req.EnableThinking != nil {
-		if *req.EnableThinking {
-			return "medium"
-		}
-		return "none"
-	}
-	if req.EnableReasoning != nil {
-		if *req.EnableReasoning {
-			return "medium"
-		}
-		return "none"
-	}
-	if req.IsReasoning != nil {
-		if *req.IsReasoning {
-			return "medium"
-		}
-		return "none"
-	}
-	return ""
+	return providers.ParseReasoningIntent(req).Level
 }
 
 // sessionAffinityDebugOn mirrors qoder2api-hub's QD_AFFINITY_DEBUG: routing

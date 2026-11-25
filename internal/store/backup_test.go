@@ -8,6 +8,7 @@ import (
 	"github.com/caigee-cmd/cli2api/internal/accounts"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -47,7 +48,9 @@ func TestStoreBackupCreatesConsistentSQLiteSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	// Windows reports synthesized permission bits instead of Unix modes; the
+	// 0600 contract is enforced by os.Chmod on Unix hosts.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("backup mode = %o, want 600", info.Mode().Perm())
 	}
 
@@ -106,6 +109,10 @@ func TestPublishedMigrationsKeepOrderedFilenameAndSQLDigest(t *testing.T) {
 		{"027_api_key_max_inflight.sql", "f5e5f592718579aa077c2f6cbd89e73a7da78e6ec0f009c183168acef43e2242"},
 		{"028_account_credit_floor.sql", "1d0ce27561c054e36e0bacd6a8eb49ae8e58fb28835461f545f0ffab74272416"},
 		{"029_account_percent_floor.sql", "cf4c2790ca5f4dc1d95c8f7446fe87a5b35f8d5e7571b7b2b297c6b5112a0587"},
+		{"030_api_key_model_aggregation.sql", "373fe14496053692251b5260b8ad4daef4af0fd5105e461efdd37bf9639a79d1"},
+		{"031_aggregations.sql", "3edaa45d50fe907d4ace839297d0264ad199ae19de97f007f248c6301239f928"},
+		{"032_aggregation_member_account.sql", "2e24df6d7363faf5f383887d589ab47bf2f0398f1e30338812066587dbf0ea01"},
+		{"033_account_checkin_status.sql", "0e4b4466a23d58eb9e7e370053ad7b52bc3285ea9461a8b99cac2bae88bba49d"},
 	}
 	if len(sqliteMigrations) != len(want) {
 		t.Fatalf("migration count = %d, want %d", len(sqliteMigrations), len(want))

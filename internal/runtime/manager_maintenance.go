@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 	"log"
 	"strings"
+	"sync"
 	"time"
 	_ "time/tzdata"
 
@@ -16,10 +17,84 @@ import (
 )
 
 func (manager *Manager) CheckinAccount(ctx context.Context, accountID string) (Account, error) {
-	return manager.checkinAccount(ctx, accountID, false)
+	return manager.checkinAccount(ctx, accountID, false, false)
 }
 
-func (manager *Manager) checkinAccount(ctx context.Context, accountID string, allowDisabled bool) (Account, error) {
+// CheckinAll runs a manual all-account pass on the server. It selects from the
+// full store instead of the browser's current page/filter, honors the system
+// "check in disabled accounts" setting, and reports every account outcome.
+// Manual passes use bounded concurrency instead of the scheduled loop's
+// inter-account gap: waiting on the UI for 13 sequential network check-ins is
+// unacceptable, while four in flight keeps upstream bursts modest.
+func (manager *Manager) CheckinAll(ctx context.Context, force, includeDisabled bool) ([]accounts.CheckinAllResult, error) {
+	if manager == nil {
+		return nil, fmt.Errorf("account manager unavailable")
+	}
+	items, err := manager.store.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	targets := make([]accounts.Account, 0, len(items))
+	for _, item := range items {
+		if !includeDisabled && !item.Enabled {
+			continue
+		}
+		if _, supported := providers.CheckinFor(item.Provider, item.ProviderRegion); !supported {
+			continue
+		}
+		if adapter, registered := manager.providers.Get(item.Provider); !registered || adapter.Checkin == nil {
+			continue
+		}
+		targets = append(targets, item)
+	}
+	results := make([]accounts.CheckinAllResult, len(targets))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, manualCheckinConcurrency)
+	started := 0
+loop:
+	for i, item := range targets {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			break loop
+		}
+		started = i + 1
+		wg.Add(1)
+		go func(index int, account accounts.Account) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			updated, checkErr := manager.checkinAccount(ctx, account.ID, includeDisabled, force)
+			result := accounts.CheckinAllResult{
+				AccountID: account.ID,
+				Provider:  account.Provider,
+				Region:    account.ProviderRegion,
+				Status:    updated.LastCheckinStatus,
+				Message:   updated.LastCheckinMsg,
+			}
+			if result.Status == "" {
+				result.Status = "success"
+			}
+			if checkErr != nil {
+				result.Status = "error"
+				if result.Message == "" {
+					result.Message = checkErr.Error()
+				}
+			}
+			results[index] = result
+		}(i, item)
+	}
+	wg.Wait()
+	if ctx.Err() != nil {
+		return results[:started], ctx.Err()
+	}
+	// Verify the claims against upstream after the pass; this refreshes the
+	// true today flag and the derived auto schedule without delaying the UI.
+	syncCtx := context.WithoutCancel(ctx)
+	go manager.SyncCheckinStatuses(syncCtx)
+	return results, nil
+}
+
+func (manager *Manager) checkinAccount(ctx context.Context, accountID string, allowDisabled, force bool) (Account, error) {
 	if manager == nil {
 		return Account{}, fmt.Errorf("account manager unavailable")
 	}
@@ -58,7 +133,7 @@ func (manager *Manager) checkinAccount(ctx context.Context, accountID string, al
 	defer cancel()
 	stop := context.AfterFunc(manager.runCtx, cancel)
 	defer stop()
-	if CheckedInLocalDay(account.LastCheckinAt, account.LastCheckinStatus, time.Now().In(location)) {
+	if !force && CheckedInLocalDay(account.LastCheckinAt, account.LastCheckinStatus, time.Now().In(location)) {
 		if account.Provider == "workbuddy" {
 			if err := manager.clearCheckinCooldown(ctx, accountID); err != nil {
 				return account, fmt.Errorf("clear cooldown after check-in: %w", err)
@@ -92,6 +167,178 @@ func (manager *Manager) checkinAccount(ctx context.Context, accountID string, al
 	defer stopReading()
 	updated, err := manager.store.Get(readCtx, accountID)
 	return updated, errors.Join(checkErr, err)
+}
+
+const (
+	// checkinStatusInterval is how often the console refreshes the true
+	// upstream check-in state. Verification is read-only and bounded; it never
+	// claims a reward.
+	checkinStatusInterval    = 15 * time.Minute
+	checkinStatusTimeout     = 75 * time.Second
+	checkinStatusConcurrency = 4
+	// A real check-in can take a few seconds to become visible upstream. Do not
+	// downgrade a local success inside this grace window.
+	checkinStatusGrace = 15 * time.Minute
+)
+
+// SyncCheckinStatuses refreshes every check-in-capable account from upstream.
+// It is safe to call concurrently; only one pass runs at a time.
+func (manager *Manager) SyncCheckinStatuses(ctx context.Context) {
+	if manager == nil {
+		return
+	}
+	manager.mu.Lock()
+	if manager.checkinStatusRunning {
+		manager.mu.Unlock()
+		return
+	}
+	manager.checkinStatusRunning = true
+	manager.mu.Unlock()
+	defer func() {
+		manager.mu.Lock()
+		manager.checkinStatusRunning = false
+		manager.mu.Unlock()
+	}()
+	items, err := manager.store.List(ctx)
+	if err != nil {
+		log.Printf("checkin status list: %v", err)
+		return
+	}
+	candidates := make([]Account, 0, len(items))
+	for _, account := range items {
+		policy, supported := providers.CheckinFor(account.Provider, account.ProviderRegion)
+		adapter, registered := manager.providers.Get(account.Provider)
+		if !supported || !registered || adapter.CheckinStatus == nil {
+			continue
+		}
+		if policy.Timezone == "" {
+			continue
+		}
+		candidates = append(candidates, account)
+	}
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, checkinStatusConcurrency)
+	for _, account := range candidates {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
+			return
+		}
+		wg.Add(1)
+		go func(account Account) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			manager.syncCheckinStatus(ctx, account)
+		}(account)
+	}
+	wg.Wait()
+}
+
+func (manager *Manager) syncCheckinStatus(ctx context.Context, account Account) {
+	manager.mu.Lock()
+	busy := manager.checkinRunning[account.ID]
+	manager.mu.Unlock()
+	if busy {
+		return
+	}
+	adapter, ok := manager.providers.Get(account.Provider)
+	if !ok || adapter.CheckinStatus == nil {
+		return
+	}
+	policy, ok := providers.CheckinFor(account.Provider, account.ProviderRegion)
+	if !ok {
+		return
+	}
+	location, err := time.LoadLocation(policy.Timezone)
+	if err != nil {
+		return
+	}
+	syncCtx, cancel := context.WithTimeout(ctx, checkinStatusTimeout)
+	defer cancel()
+	stop := context.AfterFunc(manager.runCtx, cancel)
+	defer stop()
+	result, readErr := adapter.CheckinStatus.CheckinStatus(syncCtx, account.ID)
+	now := time.Now().UTC()
+	// A manual/scheduled check-in can finish while the read-only probe is in
+	// flight. Re-read the account before deciding, so the slower probe cannot
+	// overwrite a fresh success with the state that preceded it.
+	current, currentErr := manager.store.Get(ctx, account.ID)
+	if currentErr != nil {
+		log.Printf("checkin status account=%s refresh: %v", account.ID, currentErr)
+		return
+	}
+	account = current
+	manager.mu.Lock()
+	busy = manager.checkinRunning[account.ID]
+	manager.mu.Unlock()
+	if busy {
+		return
+	}
+	earliest := strings.TrimSpace(result.EarliestCheckin)
+	if earliest == "" {
+		earliest = accounts.EarliestCheckinClock(account.Provider)
+	}
+	update := accounts.CheckinStatusUpdate{
+		Source:   "upstream",
+		AutoTime: accounts.AutoCheckinTimeFromEarliest(earliest),
+		SyncedAt: now,
+	}
+	if readErr != nil {
+		update.Status = "unknown"
+		update.Message = "上游状态同步失败：" + readErr.Error()
+	} else {
+		switch result.Status {
+		case "already":
+			update.Status = "already"
+			update.Message = strings.TrimSpace(result.Message)
+			if update.Message == "" {
+				update.Message = "上游显示今日已签到"
+			}
+			if !CheckedInLocalDay(account.LastCheckinAt, account.LastCheckinStatus, now.In(location)) {
+				update.CheckinAt = now.Format(time.RFC3339Nano)
+			}
+		case "pending":
+			update.Status = "pending"
+			update.Message = strings.TrimSpace(result.Message)
+			if update.Message == "" {
+				update.Message = "上游显示今日未签到"
+			}
+		case "skipped":
+			update.Status = "skipped"
+			update.Message = strings.TrimSpace(result.Message)
+		default:
+			update.Status = "unknown"
+			update.Message = strings.TrimSpace(result.Message)
+			if update.Message == "" {
+				update.Message = "上游签到状态未知"
+			}
+		}
+	}
+	// An upstream lag right after a real check-in must not erase a fresh local
+	// success. An "unknown" answer is not evidence that today's check-in is
+	// missing, so a real local success stands for the rest of the provider day;
+	// pending/skipped may still replace it after the grace window.
+	if update.Status != "already" && CheckedInLocalDay(account.LastCheckinAt, account.LastCheckinStatus, now.In(location)) {
+		preserveLocal := update.Status == "unknown"
+		if last, err := time.Parse(time.RFC3339Nano, account.LastCheckinAt); err == nil && now.Sub(last) < checkinStatusGrace {
+			preserveLocal = true
+		}
+		if preserveLocal {
+			update.Status = account.LastCheckinStatus
+			update.Message = account.LastCheckinMsg
+			update.CheckinAt = ""
+			update.Source = account.LastCheckinSource
+			if update.Source == "" {
+				update.Source = "local"
+			}
+		}
+	}
+	persistCtx, cancelPersist := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancelPersist()
+	if err := manager.store.RecordCheckinStatus(persistCtx, account.ID, update); err != nil {
+		log.Printf("checkin status account=%s: %v", account.ID, err)
+	}
 }
 
 func (manager *Manager) clearCheckinCooldown(ctx context.Context, accountID string) error {
@@ -177,6 +424,9 @@ func recordedToday(at string, now time.Time) bool {
 const (
 	keepaliveTickTimeout   = 90 * time.Second
 	maintenanceGapJitterMS = 1000
+	// manualCheckinConcurrency caps a user-triggered one-click check-in. It is
+	// independent of the scheduled loop's per-tick cap and gap.
+	manualCheckinConcurrency = 4
 )
 
 // Defaults are conservative; tests may override the vars to skip real sleeps.
@@ -222,7 +472,8 @@ func checkinDueFor(account Account, configuredTime string, now time.Time, allowD
 	if (!account.Enabled && !allowDisabled) || !account.AutoCheckin {
 		return false
 	}
-	if recordedToday(account.LastCheckinAt, now) && account.LastCheckinStatus != "error" {
+	if recordedToday(account.LastCheckinAt, now) &&
+		(account.LastCheckinStatus == "success" || account.LastCheckinStatus == "already") {
 		return false
 	}
 	due, err := checkinSlot(configuredTime, account.ID, now)
@@ -233,8 +484,16 @@ func checkinDueFor(account Account, configuredTime string, now time.Time, allowD
 	if err != nil || last.Before(due) {
 		return true
 	}
-	retry, _ := checkinSlot("21:00", account.ID, now)
-	return due.Before(retry) && !now.Before(retry) && last.Before(retry)
+	// The 01:00 slot can return a provisional "already" while the provider is
+	// still settling its 00:00 day. Retry at 02:05 once that window is
+	// confirmed, then keep the midday and evening safety nets.
+	for _, retryClock := range []string{"02:05", "12:05", "21:00"} {
+		retry, err := checkinSlot(retryClock, account.ID, now)
+		if err == nil && due.Before(retry) && !now.Before(retry) && last.Before(retry) {
+			return true
+		}
+	}
+	return false
 }
 
 func (manager *Manager) runScheduledCheckins(ctx context.Context, now time.Time) {
@@ -274,7 +533,7 @@ func (manager *Manager) runScheduledCheckins(ctx context.Context, now time.Time)
 		if processed > 0 && !sleepMaintenanceGap(ctx, account.ID, maintenanceAccountGap) {
 			return
 		}
-		if _, err := manager.checkinAccount(ctx, account.ID, allowDisabled); err != nil {
+		if _, err := manager.checkinAccount(ctx, account.ID, allowDisabled, false); err != nil {
 			log.Printf("checkin account=%s: %v", account.ID, err)
 		}
 		processed++
@@ -309,7 +568,7 @@ func (manager *Manager) checkinOptedIn(ctx context.Context, now time.Time, sched
 				continue
 			}
 		}
-		if _, err := manager.checkinAccount(ctx, account.ID, allowDisabled); err != nil {
+		if _, err := manager.checkinAccount(ctx, account.ID, allowDisabled, false); err != nil {
 			log.Printf("checkin account=%s: %v", account.ID, err)
 		}
 	}
@@ -396,6 +655,7 @@ func (manager *Manager) RunMaintenanceLoop(stop <-chan struct{}) {
 	// Seed the throttle so the first pass does not duplicate the boot-time
 	// RefreshAll: the next stale-quota sweep runs 5 minutes after startup.
 	lastStaleQuota := time.Now()
+	lastCheckinStatusSync := time.Time{}
 	// Liveness probes start one tick in so boot-time RefreshAll owns the first
 	// /health round-trip and short-lived tests with a stub worker are not probed
 	// the instant the loop starts.
@@ -405,6 +665,10 @@ func (manager *Manager) RunMaintenanceLoop(stop <-chan struct{}) {
 			return
 		}
 		now := time.Now()
+		if now.Sub(lastCheckinStatusSync) >= checkinStatusInterval {
+			lastCheckinStatusSync = now
+			go manager.SyncCheckinStatuses(ctx)
+		}
 		manager.runScheduledCheckins(ctx, now)
 		day := now.Format("2006-01-02")
 		if day != keepaliveProgressDay {
@@ -659,6 +923,7 @@ func (manager *Manager) probeWorkerLiveness(ctx context.Context) {
 			manager.mu.Lock()
 			delete(manager.healthFailures, item.ID)
 			manager.mu.Unlock()
+			manager.reconcileUnreadyWorker(ctx, item)
 			continue
 		}
 		// Skip accounts already in recovery: they are no longer in processes
@@ -680,6 +945,69 @@ func (manager *Manager) probeWorkerLiveness(ctx context.Context) {
 			manager.mu.Unlock()
 			manager.restartStuckWorker(item.ID, err)
 		}
+	}
+}
+
+// workerReconcileInterval throttles the "alive but not routable" re-probe. It
+// only has to be long enough that a worker waiting for login is not re-probed
+// on every liveness tick, and short enough that a worker which just finished
+// starting is promoted on the next tick or two.
+const workerReconcileInterval = 2 * time.Minute
+
+// reconcileUnreadyWorker re-runs the full account refresh for a worker that
+// answers /health but is still absent from routing.
+//
+// The boot-time RefreshAll starts as soon as the manager does, before a freshly
+// spawned worker has bound its port. That first probe fails on transport,
+// refreshOne persists status=error, and nothing re-probes afterwards: the
+// account, and every model only it could serve, stays unrouteable (clients see
+// "no accounts available for this api key") until an operator clicks Refresh in
+// the console. A recovery restart has the same shape — startAccount leaves the
+// item unready and no refresh follows it.
+//
+// probeWorkerLiveness is the only loop still talking to such a worker, so it is
+// the right place to notice that the worker came up: a successful /health means
+// the process is listening, and refreshOne is what promotes the pool item and
+// the stored status back to ready.
+//
+// A reconcile is a full refresh, not a cheap probe: once the worker reports
+// ready, refreshOne also runs fetchQuota and fetchAccountModels concurrently.
+// That catalog refresh is the point — without it routing never learns which
+// models the recovered account serves — so the extra upstream calls are
+// accepted, and the per-account throttle above caps them at one round each per
+// interval. While a worker stays unready (for example waiting for login),
+// refreshOne persists login_required, or error when the worker reports a
+// LastError, on every reconcile; the status is rewritten with the same value
+// each time. refreshStaleQuota does not double-fetch in the same tick: it only
+// touches accounts whose cached quota says Exceeded and refreshOne fetches
+// quota only after the worker turns ready. A console Refresh goes through
+// RefreshAccount → refreshOne directly and is not gated by this throttle, so an
+// operator refresh can overlap one watchdog refresh; both then issue the same
+// probe, which the pool and quota gates tolerate, and the overlap (one extra
+// /health plus one extra quota/catalog fetch) only happens on an explicit
+// operator action.
+func (manager *Manager) reconcileUnreadyWorker(ctx context.Context, item Item) {
+	if item.Runtime == string(providers.RuntimeInProcess) || strings.TrimSpace(item.URL) == "" {
+		return
+	}
+	if item.RuntimeState == "dead" || item.RuntimeState == "ready" {
+		return
+	}
+	manager.mu.Lock()
+	last, seen := manager.reconcileAt[item.ID]
+	if seen && time.Since(last) < workerReconcileInterval {
+		manager.mu.Unlock()
+		return
+	}
+	manager.reconcileAt[item.ID] = time.Now()
+	manager.mu.Unlock()
+
+	if err := manager.refreshOne(ctx, item, false); err != nil {
+		log.Printf("worker reconcile: account %s is still not routable: %v", item.ID, err)
+		return
+	}
+	if refreshed, ok := manager.pool.ByID(item.ID); ok && refreshed.RuntimeState == "ready" {
+		log.Printf("worker reconcile: account %s came up after an unready start; routing restored", item.ID)
 	}
 }
 

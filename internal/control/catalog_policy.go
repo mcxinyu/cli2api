@@ -46,6 +46,7 @@ func EntryModelRegions(entry map[string]any) []string {
 // MergeModelEntryCapabilities folds a later source entry into the merged one
 // conservatively: numeric fields take the minimum and boolean fields are ANDed.
 func MergeModelEntryCapabilities(merged, incoming map[string]any) {
+	mergeReasoningOptions(merged, incoming)
 	for _, field := range modelsNumericCapFields {
 		mergedValue, ok1 := numericFieldValue(merged[field])
 		incomingValue, ok2 := numericFieldValue(incoming[field])
@@ -99,6 +100,61 @@ func MergeModelEntryPricing(merged, incoming map[string]any) {
 	}
 }
 
+func reasoningValues(entry map[string]any, keys ...string) []string {
+	if len(keys) == 0 {
+		keys = []string{"reasoning_option_values", "reasoning_options"}
+	}
+	for _, key := range keys {
+		switch typed := entry[key].(type) {
+		case []string:
+			if values := providers.UniqueReasoningOptionValues(typed); len(values) > 0 {
+				return values
+			}
+		case []any:
+			raw := make([]string, 0, len(typed))
+			for _, item := range typed {
+				if value, ok := item.(string); ok {
+					raw = append(raw, value)
+				}
+			}
+			if values := providers.UniqueReasoningOptionValues(raw); len(values) > 0 {
+				return values
+			}
+		}
+	}
+	return nil
+}
+
+func mergeReasoningOptionSet(merged, incoming map[string]any, key string) {
+	values := reasoningValues(merged, key)
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		seen[strings.ToLower(value)] = struct{}{}
+	}
+	for _, value := range reasoningValues(incoming, key) {
+		if _, ok := seen[strings.ToLower(value)]; ok {
+			continue
+		}
+		seen[strings.ToLower(value)] = struct{}{}
+		values = append(values, value)
+	}
+	if len(values) > 0 {
+		merged[key] = values
+	}
+}
+
+func mergeReasoningOptions(merged, incoming map[string]any) {
+	mergeReasoningOptionSet(merged, incoming, "reasoning_options")
+	mergeReasoningOptionSet(merged, incoming, "reasoning_option_values")
+	for _, key := range []string{"reasoning_default", "reasoning_type"} {
+		if _, ok := merged[key]; !ok {
+			if value, ok := incoming[key]; ok && value != "" {
+				merged[key] = value
+			}
+		}
+	}
+}
+
 func numericFieldValue(value any) (float64, bool) {
 	switch typed := value.(type) {
 	case int:
@@ -141,6 +197,19 @@ func ModelCapabilitiesEntry(model providers.ModelInfo) map[string]any {
 	}
 	if model.Capabilities.CanDisableThinking {
 		entry["can_disable_thinking"] = true
+	}
+	if len(model.Capabilities.ReasoningOptionValues) > 0 {
+		entry["reasoning_option_values"] = model.Capabilities.ReasoningOptionValues
+	}
+	reasoningOptions := providers.UniqueReasoningOptions(model.Capabilities.ReasoningOptions)
+	if len(reasoningOptions) > 0 {
+		entry["reasoning_options"] = reasoningOptions
+	}
+	if model.Capabilities.ReasoningDefault != "" {
+		entry["reasoning_default"] = model.Capabilities.ReasoningDefault
+	}
+	if model.Capabilities.ReasoningType != "" {
+		entry["reasoning_type"] = model.Capabilities.ReasoningType
 	}
 	entry["supports_images"] = model.Capabilities.Images
 	return entry
@@ -192,8 +261,12 @@ func ProviderModelEntry(model providers.ModelInfo, provider string) map[string]a
 	if hasMaxTier(model.Capabilities) {
 		entry["supports_max_mode"] = true
 	}
-	if len(model.Capabilities.ReasoningOptions) > 0 {
-		entry["reasoning_options"] = model.Capabilities.ReasoningOptions
+	reasoningOptions := providers.UniqueReasoningOptions(model.Capabilities.ReasoningOptions)
+	if len(reasoningOptions) > 0 {
+		entry["reasoning_options"] = reasoningOptions
+	}
+	if len(model.Capabilities.ReasoningOptionValues) > 0 {
+		entry["reasoning_option_values"] = model.Capabilities.ReasoningOptionValues
 	}
 	if model.Capabilities.ReasoningDefault != "" {
 		entry["reasoning_default"] = model.Capabilities.ReasoningDefault
@@ -275,6 +348,165 @@ func ModelServedByAccounts(entry map[string]any, identity auth.Identity, pool []
 	return false
 }
 
+// ExpandModelAliases appends one public entry for every account alias whose
+// target is present in the current catalog. Routing already rewrites an alias
+// per account; without this entry a client only discovers the alias by
+// guessing its name. Existing ids win, so an alias never shadows a real model.
+func ExpandModelAliases(models []map[string]any, pool []AccountModelAllow) []map[string]any {
+	if len(models) == 0 || len(pool) == 0 {
+		return models
+	}
+	byTarget := make(map[string]map[string]any, len(models)*2)
+	existing := make(map[string]bool, len(models))
+	for _, model := range models {
+		id, _ := model["id"].(string)
+		key := modelAllowKey(id)
+		if key == "" {
+			continue
+		}
+		existing[key] = true
+		provider := modelEntryProvider(model)
+		if provider != "" {
+			byTarget[provider+"@"+key] = model
+		}
+		if _, ok := byTarget["@"+key]; !ok {
+			byTarget["@"+key] = model
+		}
+	}
+	extra := make([]map[string]any, 0)
+	seen := make(map[string]bool)
+	for _, account := range pool {
+		provider := accounts.NormalizeProviderFamily(account.Provider)
+		if provider == "" {
+			continue
+		}
+		for alias, target := range account.Aliases {
+			aliasKey := accounts.CanonicalModelID(alias)
+			targetKey := accounts.CanonicalModelID(target)
+			if aliasKey == "" || aliasKey == "auto" || targetKey == "" || targetKey == "auto" || aliasKey == targetKey {
+				continue
+			}
+			if existing[aliasKey] {
+				continue
+			}
+			if !accountServesModel(account, targetKey) {
+				continue
+			}
+			base := byTarget[provider+"@"+targetKey]
+			if base == nil {
+				base = byTarget["@"+targetKey]
+			}
+			if base == nil || !accountServesRegion(account.Region, EntryModelRegions(base)) {
+				continue
+			}
+			dedupeKey := provider + "@" + aliasKey
+			if seen[dedupeKey] {
+				continue
+			}
+			seen[dedupeKey] = true
+			entry := CloneModelEntry(base)
+			entry["id"] = aliasKey
+			entry["display_name"] = aliasKey
+			entry["alias_of"] = targetKey
+			extra = append(extra, entry)
+		}
+	}
+	if len(extra) == 0 {
+		return models
+	}
+	out := make([]map[string]any, 0, len(models)+len(extra))
+	out = append(out, models...)
+	out = append(out, extra...)
+	return out
+}
+
+// AggregateModelEntries is the model-list view for a key that enabled
+// cross-provider aggregation. It walks the accounts the key may reach, keeps
+// their public aliases, and folds same-name aliases from different providers
+// into one provider-neutral entry. Routing is untouched: the gateway still
+// resolves the alias through the account pool, so the response never claims a
+// provider.
+func AggregateModelEntries(models []map[string]any, identity auth.Identity, pool []AccountModelAllow) []map[string]any {
+	if !identity.ModelAggregation {
+		return models
+	}
+	byTarget := make(map[string][]map[string]any, len(models))
+	realIDs := make(map[string]bool, len(models))
+	for _, model := range models {
+		id, _ := model["id"].(string)
+		key := modelAllowKey(id)
+		if key == "" {
+			continue
+		}
+		byTarget[key] = append(byTarget[key], model)
+		if aliasOf, _ := model["alias_of"].(string); strings.TrimSpace(aliasOf) == "" {
+			realIDs[key] = true
+		}
+	}
+	seen := make(map[string]bool, len(models))
+	out := make([]map[string]any, 0, len(models))
+	for _, account := range pool {
+		provider := accounts.NormalizeProviderFamily(account.Provider)
+		if !identity.AllowsProvider(provider) || !identity.AllowsProviderRegion(provider, account.Region) {
+			continue
+		}
+		for alias, target := range account.Aliases {
+			aliasKey := accounts.CanonicalModelID(alias)
+			targetKey := accounts.CanonicalModelID(target)
+			if aliasKey == "" || aliasKey == "auto" || targetKey == "" || targetKey == "auto" || aliasKey == targetKey {
+				continue
+			}
+			if realIDs[aliasKey] || seen[aliasKey] || !accountServesModel(account, targetKey) {
+				continue
+			}
+			base := aliasBaseEntry(byTarget[targetKey], provider, account.Region)
+			if base == nil {
+				continue
+			}
+			seen[aliasKey] = true
+			entry := CloneModelEntry(base)
+			entry["id"] = aliasKey
+			entry["display_name"] = aliasKey
+			entry["owned_by"] = "aggregate"
+			// alias_of and provider metadata describe how one account serves
+			// the name; an aggregate key must not see either.
+			for _, field := range []string{
+				"alias_of", "provider", "native_model", "region", "regions", "credits", "free",
+			} {
+				delete(entry, field)
+			}
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+// aliasBaseEntry picks the catalog entry an account actually serves for the
+// alias target, preferring the same provider. A target id can exist in several
+// regions, and blindly taking the first entry would drop a valid alias whose
+// account lives in another region.
+func aliasBaseEntry(candidates []map[string]any, provider, region string) map[string]any {
+	for _, candidate := range candidates {
+		if modelEntryProvider(candidate) == provider && accountServesRegion(region, EntryModelRegions(candidate)) {
+			return candidate
+		}
+	}
+	for _, candidate := range candidates {
+		if accountServesRegion(region, EntryModelRegions(candidate)) {
+			return candidate
+		}
+	}
+	return nil
+}
+
+func modelEntryProvider(model map[string]any) string {
+	provider, _ := model["provider"].(string)
+	if strings.TrimSpace(provider) == "" {
+		provider, _ = model["owned_by"].(string)
+	}
+	return accounts.NormalizeProviderFamily(provider)
+}
+
 // FilterModelsByAccountAllow drops catalog entries no granted account will
 // serve. See ModelServedByAccounts for the empty-pool and mixed-account rules.
 func FilterModelsByAccountAllow(models []map[string]any, identity auth.Identity, pool []AccountModelAllow) []map[string]any {
@@ -321,17 +553,15 @@ func accountServesModel(account AccountModelAllow, modelKey string) bool {
 
 // modelAllowKey folds a catalog id the same way routing folds a request, and
 // strips a provider prefix ("qoder/glm-5.2", "workbuddy-cn/glm-5.2") so a
-// prefixed public list matches the bare ids stored on the account.
+// prefixed public list matches the bare ids stored on the account. "auto" is a
+// real catalog entry and must obey a restricted account's enabled list; only an
+// empty/unparseable id bypasses the allowlist.
 func modelAllowKey(id string) string {
 	id = strings.TrimSpace(id)
 	if slash := strings.LastIndex(id, "/"); slash >= 0 {
 		id = id[slash+1:]
 	}
-	key := accounts.CanonicalModelID(id)
-	if key == "" || key == "auto" {
-		return ""
-	}
-	return key
+	return accounts.CanonicalModelID(id)
 }
 
 // FilterModelsForIdentity applies grants after loading the shared catalog.

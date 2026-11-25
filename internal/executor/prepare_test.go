@@ -74,6 +74,51 @@ func TestPrepareStripsPrefixAndChecksGrants(t *testing.T) {
 	}
 }
 
+func TestPrepareAggregationKeyOnlyAcceptsItsAliases(t *testing.T) {
+	pool := NewPool(nil, nil)
+	pool.Upsert(Item{
+		ID: "q1", Provider: "qoder", Models: []string{"kimi-k2.6"},
+		ModelAliases: map[string]string{"kimi-k3": "kimi-k2.6"},
+	})
+	ex := NewChatExecutor(pool, "")
+	identity := auth.KeyIdentity(accounts.APIKey{
+		ID: "key_agg", Name: "agg", Providers: []string{"qoder"}, Enabled: true, ModelAggregation: true,
+	})
+	request := translate.ChatRequest{Model: "kimi-k3", Messages: []translate.ChatMessage{{Role: "user", Content: "hi"}}}
+	got, err := ex.Prepare(PrepareInput{
+		Request: request, Identity: identity, ModelAggregation: true,
+		NewRequestID: func() string { return "req_agg" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Request.Model != "kimi-k3" || got.PublicModel != "kimi-k3" || got.ProviderFilter != "" {
+		t.Fatalf("aggregation prepare=%+v", got)
+	}
+
+	for _, model := range []string{"glm-5.2", "qoder/kimi-k3"} {
+		_, err := ex.Prepare(PrepareInput{
+			Request:          translate.ChatRequest{Model: model, Messages: []translate.ChatMessage{{Role: "user", Content: "hi"}}},
+			Identity:         identity,
+			ModelAggregation: true,
+		})
+		var prepared *PrepareError
+		if err == nil || !asPrepareError(err, &prepared) || prepared.Code != "model_not_aggregated" {
+			t.Fatalf("model=%s err=%v", model, err)
+		}
+	}
+
+	// An alias defined only on an ungranted provider is not reachable.
+	identity.AllowedProviders = []string{"workbuddy"}
+	if _, err := ex.Prepare(PrepareInput{
+		Request:          translate.ChatRequest{Model: "kimi-k3", Messages: []translate.ChatMessage{{Role: "user", Content: "hi"}}},
+		Identity:         identity,
+		ModelAggregation: true,
+	}); err == nil {
+		t.Fatal("ungranted provider alias was accepted")
+	}
+}
+
 func TestPrepareDeniesUngrantedProvider(t *testing.T) {
 	ex := NewChatExecutor(NewPool(nil, nil), "")
 	_, err := ex.Prepare(PrepareInput{
@@ -249,6 +294,42 @@ func TestPreparePreservesExplicitContext(t *testing.T) {
 	}
 }
 
+func TestResolveProviderFilterCoversAllRegisteredProviderPrefixes(t *testing.T) {
+	for _, prefix := range []string{
+		"qoder", "workbuddy", "trae", "devin", "command", "codex",
+		"zhipu", "qwenwork", "kimi", "codearts", "kiro", "meta", "muse",
+	} {
+		req := translate.ChatRequest{Model: prefix + "/demo-model"}
+		provider, region := ResolveProviderFilter(&req, false)
+		want := accounts.NormalizeProviderFamily(prefix)
+		if provider != want || req.Model != "demo-model" || region != "" {
+			t.Fatalf("%s prefix => provider=%q model=%q region=%q", prefix, provider, req.Model, region)
+		}
+	}
+}
+
+func TestRequestedReasoningLevelFromThinkingBudget(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "enabled low budget", raw: `{"type":"enabled","budget_tokens":2048}`, want: "low"},
+		{name: "enabled high budget", raw: `{"type":"enabled","budget_tokens":16384}`, want: "high"},
+		{name: "missing budget", raw: `{"type":"enabled"}`, want: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := RequestedReasoningLevel(translate.ChatRequest{Thinking: json.RawMessage(test.raw)})
+			if got != test.want {
+				t.Fatalf("level=%q, want %q", got, test.want)
+			}
+		})
+	}
+	if got := RequestedReasoningLevel(translate.ChatRequest{ReasoningEffort: json.RawMessage(`"ultra"`)}); got != "max" {
+		t.Fatalf("ultra=%q, want max", got)
+	}
+}
+
 func asPrepareError(err error, out **PrepareError) bool {
 	if err == nil {
 		return false
@@ -273,6 +354,7 @@ func TestProviderPrefixRecognizesCommand(t *testing.T) {
 		"command/moonshotai/Kimi-K3":       "command",
 		"codearts/GLM-5.2":                 "codearts",
 		"kiro/claude-sonnet-4.5":           "kiro",
+		"doubaowork/doubao-auto":           "doubaowork",
 		// Region-qualified dash form.
 		"workbuddy-cn/glm-5.3-flash":   "workbuddy",
 		"workbuddy-gl/glm-5.3-flash":   "workbuddy",

@@ -102,7 +102,14 @@ func (s *fakeStore) Get(_ context.Context, id string) (accounts.Account, error) 
 	}
 	return account, nil
 }
-func (s *fakeStore) List(context.Context) ([]accounts.Account, error) { return nil, nil }
+func (s *fakeStore) List(context.Context) ([]accounts.Account, error) {
+	s.log.add("store.List")
+	out := make([]accounts.Account, 0, len(s.accounts))
+	for _, account := range s.accounts {
+		out = append(out, account)
+	}
+	return out, nil
+}
 func (s *fakeStore) Update(_ context.Context, id string, input accounts.UpdateAccount) error {
 	s.log.add("store.Update")
 	if s.updateErr != nil {
@@ -161,8 +168,11 @@ func (s *fakeStore) Observe(context.Context, string, string, string, string, str
 	return nil
 }
 func (s *fakeStore) ObserveHealth(context.Context, string, string, string, string) error { return nil }
-func (s *fakeStore) SaveQuota(context.Context, string, *accounts.QuotaSnapshot) error { return nil }
+func (s *fakeStore) SaveQuota(context.Context, string, *accounts.QuotaSnapshot) error    { return nil }
 func (s *fakeStore) RecordCheckin(context.Context, string, string, string, time.Time) error {
+	return nil
+}
+func (s *fakeStore) RecordCheckinStatus(context.Context, string, accounts.CheckinStatusUpdate) error {
 	return nil
 }
 func (s *fakeStore) ListCheckinRecords(_ context.Context, accountID string, _ int) ([]accounts.CheckinRecord, error) {
@@ -289,6 +299,26 @@ func (s *fakeStore) TouchAPIKey(_ context.Context, id string) error {
 	return nil
 }
 
+func (s *fakeStore) InsertAggregation(_ context.Context, agg accounts.Aggregation) (accounts.Aggregation, error) {
+	return agg, nil
+}
+
+func (s *fakeStore) SaveAggregation(_ context.Context, agg accounts.Aggregation) (accounts.Aggregation, error) {
+	return agg, nil
+}
+
+func (s *fakeStore) ListAggregations(_ context.Context) ([]accounts.Aggregation, error) {
+	return []accounts.Aggregation{}, nil
+}
+
+func (s *fakeStore) GetAggregation(_ context.Context, id string) (accounts.Aggregation, error) {
+	return accounts.Aggregation{}, accounts.ErrAggregationNotFound
+}
+
+func (s *fakeStore) DeleteAggregation(_ context.Context, _ string) error {
+	return nil
+}
+
 type fakeRuntime struct {
 	log         *callLog
 	store       *fakeStore
@@ -365,6 +395,13 @@ func (r *fakeRuntime) CheckinAccount(_ context.Context, id string) (accounts.Acc
 		r.checkedIn = r.store.accounts[id]
 	}
 	return r.checkedIn, nil
+}
+func (r *fakeRuntime) CheckinAll(context.Context, bool, bool) ([]accounts.CheckinAllResult, error) {
+	r.log.add("runtime.CheckinAll")
+	if r.checkinErr != nil {
+		return nil, r.checkinErr
+	}
+	return []accounts.CheckinAllResult{{AccountID: r.checkedIn.ID, Status: "success"}}, nil
 }
 func (r *fakeRuntime) ReloadProxyURL(_ context.Context, value string) error {
 	r.log.add("runtime.ReloadProxyURL")
